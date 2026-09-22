@@ -19,11 +19,11 @@ from typer.testing import CliRunner
 
 from roblox_studio_cli import display_wake as display_wake_module
 from roblox_studio_cli import main as main_module
+from roblox_studio_cli.luau_source import MAX_LUAU_SOURCE_BYTES
 from roblox_studio_cli.main import (
     EXIT_NOT_READY,
     EXIT_OK,
     EXIT_REQUEST_ERROR,
-    MAX_LUAU_FILE_BYTES,
     app,
 )
 from roblox_studio_cli.terminal import MAX_DIAGNOSTIC_TEXT_CHARS
@@ -500,10 +500,17 @@ def test_a_luau_file_that_is_not_a_regular_file_is_refused(tmp_path):
 
 def test_an_oversized_luau_file_is_refused_with_its_size(tmp_path):
     script = tmp_path / "huge.luau"
-    script.write_bytes(b"-" * (MAX_LUAU_FILE_BYTES + 1))
+    script.write_bytes(b"-" * (MAX_LUAU_SOURCE_BYTES + 1))
     result = invoke(["luau", "--file", str(script)])
     assert result.exit_code == EXIT_REQUEST_ERROR
     assert "capped at" in all_output(result)
+
+
+def test_oversized_luau_on_stdin_is_refused_the_same_way():
+    """Same script, different door: `-` read the whole stream while --file said no."""
+    result = invoke(["luau", "-"], input="-" * (MAX_LUAU_SOURCE_BYTES + 1))
+    assert result.exit_code == EXIT_REQUEST_ERROR, all_output(result)[:300]
+    assert "capped" in all_output(result)
 
 
 def test_a_capture_that_never_answers_names_the_sleeping_display(tmp_path):

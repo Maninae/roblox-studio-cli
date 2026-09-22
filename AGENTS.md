@@ -15,6 +15,7 @@ Orientation for anyone (human or agent) changing this repo. The README explains 
 | `client.py` | Process and protocol. Spawn the proxy, run the handshake, write requests, match responses, drain stderr, reap the child. |
 | `discovery.py` | Which live tool to call, with which arguments, on which Studio instance. Includes the attach poll. |
 | `image_output.py` | Where a returned image lands on disk, and the refusals on the way (traversal, symlink, clobber). |
+| `luau_source.py` | Where one `luau` call's source comes from: an argument, stdin, or a file, with the same byte cap on the two that read somebody else's bytes. |
 | `display_wake.py` | macOS only: wake the display for a capture and hold it awake, because a dark display captures nothing. |
 | `doctor_report.py` | The `doctor` health check: gather the four facts, render them, name the verdict. |
 | `main.py` | Typer commands, output, exit codes. No protocol knowledge. |

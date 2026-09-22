@@ -25,9 +25,6 @@ Anything the bridge said reaches the terminal through
 import functools
 import json
 import math
-import os
-import stat
-import sys
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
@@ -68,6 +65,7 @@ from roblox_studio_cli.errors import (
     StudioRequestError,
 )
 from roblox_studio_cli.image_output import save_images
+from roblox_studio_cli.luau_source import read_luau_source
 from roblox_studio_cli.mcp_payloads import ToolCallResult, ToolDefinition
 from roblox_studio_cli.terminal import (
     capped_display_names,
@@ -83,12 +81,8 @@ EXIT_REQUEST_ERROR = 2
 # CLI gives up first and never sees the WARN that explains what is wrong.
 DOCTOR_TIMEOUT_SECONDS = 25.0
 DEFAULT_LUAU_CONTEXT = "Edit"
-STDIN_SOURCE_MARKER = "-"
 CAPTURE_ID_RANDOM_CHARS = 12
 TOOL_NAME_COLUMN_WIDTH = 26
-# Studio's Luau box is not where a multi-megabyte script belongs, and the write
-# to the proxy is bounded too, so say no here where the message can be useful.
-MAX_LUAU_FILE_BYTES = 8 * 2**20
 
 # Typer's rich traceback renders the frames of an unexpected exception, and with
 # locals enabled it prints the variables in them: on this CLI those hold whole
@@ -268,51 +262,6 @@ def declared_arguments(tool: ToolDefinition) -> str:
 def generate_capture_id() -> str:
     """A fresh id for one screen capture, unique enough for back-to-back calls."""
     return f"roblox-studio-{uuid.uuid4().hex[:CAPTURE_ID_RANDOM_CHARS]}"
-
-
-def read_luau_source(code: Optional[str], file_path: Optional[Path]) -> str:
-    """Resolve Luau source from the argument, stdin, or a file, whichever was given.
-
-    Called before the proxy is spawned, so a typo costs nothing but a message.
-    """
-    if file_path is not None:
-        if code:
-            raise StudioRequestError("pass Luau source as an argument or with --file, not both")
-        check_luau_file_is_readable_and_bounded(file_path)
-        try:
-            return file_path.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError) as read_error:
-            raise StudioRequestError(f"cannot read {file_path}: {read_error}") from read_error
-    if code is None:
-        raise StudioRequestError(
-            "provide Luau source as an argument, `-` to read stdin, or --file PATH"
-        )
-    if code == STDIN_SOURCE_MARKER:
-        return sys.stdin.read()
-    return code
-
-
-def check_luau_file_is_readable_and_bounded(file_path: Path) -> None:
-    """Refuse a `--file` that is not an ordinary, reasonably sized source file.
-
-    A FIFO or a device passes an `exists()` check and then blocks the read
-    forever, and a huge file is a slow way to discover that the request will not
-    fit down the pipe anyway.
-    """
-    try:
-        status = os.stat(file_path)
-    except OSError as stat_error:
-        raise StudioRequestError(f"cannot read {file_path}: {stat_error}") from stat_error
-    if not stat.S_ISREG(status.st_mode):
-        raise StudioRequestError(
-            f"{file_path} is not a regular file (reading a FIFO or device would block); "
-            "--file takes a Luau source file"
-        )
-    if status.st_size > MAX_LUAU_FILE_BYTES:
-        raise StudioRequestError(
-            f"{file_path} is {status.st_size} bytes; --file is capped at "
-            f"{MAX_LUAU_FILE_BYTES} bytes. Read it in Studio instead of sending it."
-        )
 
 
 @app.command("doctor")
