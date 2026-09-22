@@ -5,14 +5,21 @@ on:
     branches: [master]
   pull_request:
 
+# Nothing here writes to the repository, so nothing here gets a write token.
+permissions:
+  contents: read
+
 jobs:
   test:
     # macOS only: the client selects on pipe file descriptors, which POSIX
     # supports and Windows does not, and the Studio proxy path is a .app bundle.
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      # Actions are pinned by commit, not by tag: a tag is a moving pointer the
+      # action's owner can repoint, and this workflow runs with the repository
+      # checked out. The trailing comment is the release the commit belongs to.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.12"
       - run: pip install -e ".[test]"
