@@ -111,14 +111,22 @@ JSON_OPTION = typer.Option(
 
 
 def validate_timeout_seconds(value: float) -> float:
-    """Reject a `--timeout` that is not a real number of seconds.
+    """Reject a `--timeout` that is not a real, forward-going number of seconds.
 
     Click parses "nan" and "inf" happily, and both poison every deadline built
     from them: every comparison against NaN is False, so the read loop neither
     times out nor proceeds.
+
+    Zero and negative values parse too, and they are worse, because they look
+    like an answer. A deadline already in the past makes the first `select()`
+    return nothing, so `luau --timeout 0` reported "the proxy stopped reading
+    its input" and `doctor --timeout -1` printed NOT CONNECTED, both against a
+    bridge that was working. The caller's number is the bug, so it exits 2.
     """
     if not math.isfinite(value):
         raise typer.BadParameter("--timeout must be a finite number of seconds")
+    if value <= 0:
+        raise typer.BadParameter("--timeout must be a positive number of seconds")
     return value
 
 

@@ -472,6 +472,23 @@ def test_a_non_finite_timeout_is_refused_before_it_poisons_a_deadline():
         assert "finite" in all_output(result), value
 
 
+def test_a_non_positive_timeout_is_refused_instead_of_misdiagnosing_the_bridge():
+    """A deadline already in the past makes the first select() look like a fault.
+
+    Measured against the fake server: `luau --timeout 0` reported "the Studio
+    MCP proxy stopped reading its input", and `doctor --timeout -1` printed NOT
+    CONNECTED, both against a bridge that was answering normally.
+    """
+    for value in ("0", "-1", "-0.5"):
+        result = invoke(["luau", "print(1)", "--timeout", value])
+        assert result.exit_code == EXIT_REQUEST_ERROR, value
+        assert "positive" in all_output(result), value
+
+    doctored = invoke(["doctor", "--timeout", "0"])
+    assert doctored.exit_code == EXIT_REQUEST_ERROR
+    assert "NOT CONNECTED" not in all_output(doctored), "a false verdict for a working bridge"
+
+
 def test_a_luau_file_that_is_not_a_regular_file_is_refused(tmp_path):
     """Reading a FIFO blocks forever, and it passes every exists() check on the way."""
     fifo = tmp_path / "script.luau"
