@@ -11,13 +11,18 @@ carries. So this module treats all three as hostile.
   through the handle that call is still holding: reserving a name, closing it,
   and reopening by name is a window something else can put a symlink into.
 - An explicit `--out` is never followed through a symlink, never written to
-  anything that is not a regular file (a FIFO would block the process), and
-  never silently overwritten: opening uses `O_NOFOLLOW`, plus `O_EXCL` unless
-  `--force` says otherwise.
+  anything that is not a regular file (a FIFO would block the process), never
+  written to a path that shares its inode with another name (truncating one
+  hard link rewrites the file under all of them), and never silently
+  overwritten: opening uses `O_NOFOLLOW`, plus `O_EXCL` unless `--force` says
+  otherwise.
 - The server does not get to decide how many files land. A result carrying more
   than `MAX_IMAGES_PER_RESULT` images is refused with nothing written, and
   `--force` licenses overwriting the one path the caller named, never the
   `-2`, `-3` siblings.
+- Every frame is decoded and signature-checked before any of them is written,
+  because a result whose later frame is a mislabelled payload used to leave the
+  earlier ones on disk for a call the CLI then reported as failed.
 - A mismatch between the caller's extension and the MIME type the tool returned
   is reported, never fixed: renaming the caller's `--out` behind their back is
   worse than handing them a `.png` that holds JPEG bytes and saying so.
@@ -95,9 +100,10 @@ def write_image_bytes(path: Path, data: bytes, force: bool) -> None:
 
     Raises:
         StudioRequestError: the path is a directory, a symlink or anything else
-            that is not a regular file, already exists without `--force`, or
-            cannot be written. All caller-fixable, so they exit 2 rather than
-            looking like a Studio failure.
+            that is not a regular file, is a second name for a file something
+            else also holds, already exists without `--force`, or cannot be
+            written. All caller-fixable, so they exit 2 rather than looking like
+            a Studio failure.
     """
     # Directory first: on macOS /tmp is itself a symlink, so the symlink check
     # would otherwise answer "--out /tmp" with a confusing message.
@@ -105,11 +111,18 @@ def write_image_bytes(path: Path, data: bytes, force: bool) -> None:
         raise StudioRequestError(f"{path} is a directory; --out takes a file path")
     if path.is_symlink():
         raise StudioRequestError(f"refusing to write through the symlink at {path}")
-    existing_mode = lstat_mode(path)
-    if existing_mode is not None and not stat.S_ISREG(existing_mode):
+    existing = lstat_status(path)
+    if existing is not None and not stat.S_ISREG(existing.st_mode):
         raise StudioRequestError(
             f"{path} is not a regular file (a FIFO or device would block this process); "
             "--out takes a file path"
+        )
+    # O_NOFOLLOW stops a symlink; a hard link is the same file under another
+    # name, and truncating it rewrites what every other name points at.
+    if existing is not None and existing.st_nlink > 1:
+        raise StudioRequestError(
+            f"{path} has {existing.st_nlink} hard links, so writing it would replace the "
+            "contents of the other names too; point --out somewhere of its own"
         )
 
     flags = os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW
@@ -130,10 +143,10 @@ def write_image_bytes(path: Path, data: bytes, force: bool) -> None:
         raise StudioRequestError(f"cannot write to {path}: {write_error}") from write_error
 
 
-def lstat_mode(path: Path) -> int | None:
-    """The st_mode of `path` without following symlinks, or None when it does not exist."""
+def lstat_status(path: Path) -> os.stat_result | None:
+    """The lstat of `path`, not following symlinks, or None when it does not exist."""
     try:
-        return os.lstat(path).st_mode
+        return os.lstat(path)
     except (FileNotFoundError, NotADirectoryError):
         return None
     except OSError as stat_error:
@@ -170,19 +183,24 @@ def save_images(
     says: the caller licensed one path, not a family of them. Without `--out`,
     each image gets its own temp file.
 
+    Every frame is decoded and signature-checked before any of them is written,
+    so a result whose second frame is a mislabelled payload leaves nothing
+    behind and does not spend the caller's single `--force` on a bad result.
+
     Raises:
-        StudioMcpError: the result carried more images than one call may write.
-            Nothing is written in that case, including the first few.
+        StudioMcpError: the result carried more images than one call may write,
+            or a frame did not decode as the format it claimed. Nothing is
+            written in either case, including the frames that were fine.
     """
     if len(images) > MAX_IMAGES_PER_RESULT:
         raise StudioMcpError(
             f"the tool returned {len(images)} images (limit {MAX_IMAGES_PER_RESULT}); "
             "wrote none of them. Use --json to get the payload as-is."
         )
+    payloads = [(image, image.decoded_bytes()) for image in images]
 
     written: list[SavedImage] = []
-    for index, image in enumerate(images):
-        data = image.decoded_bytes()
+    for index, (image, data) in enumerate(payloads):
         if out_path is None:
             temporary = write_temporary_image_file(tool_name, image.file_extension(), data)
             written.append(SavedImage(temporary))

@@ -25,6 +25,8 @@ PNG_BYTES = b"\x89PNG\r\n\x1a\n" + b"payload"
 PNG_IMAGE = ToolImage("image/png", base64.b64encode(PNG_BYTES).decode())
 JPEG_BYTES = b"\xff\xd8\xff" + b"payload"
 JPEG_IMAGE = ToolImage("image/jpeg", base64.b64encode(JPEG_BYTES).decode())
+# Declares PNG, carries a shell script: refused by the signature check.
+MISLABELLED_IMAGE = ToolImage("image/png", base64.b64encode(b"#!/bin/sh").decode())
 HOSTILE_TOOL_NAME = "../../../tmp/hostile_escape/pwned"
 
 
@@ -158,3 +160,37 @@ def test_a_mislabelled_payload_never_reaches_the_disk(tmp_path):
     with pytest.raises(Exception, match="signature mismatch"):
         save_images([script], "screen_capture", target, force=True)
     assert not target.exists()
+
+
+def test_a_bad_frame_leaves_the_frames_before_it_unwritten(tmp_path):
+    """The server chooses how many frames come back and what is inside each one.
+
+    Writing them one at a time handed the caller the first two of three and then
+    reported failure, which is the worst of both: files on disk for a call the
+    CLI says did not happen.
+    """
+    target = tmp_path / "shot.png"
+    with pytest.raises(StudioMcpError, match="signature mismatch"):
+        save_images([PNG_IMAGE, MISLABELLED_IMAGE], "screen_capture", target, force=False)
+    assert list(tmp_path.iterdir()) == [], "an earlier frame was written before the later one failed"
+
+
+def test_a_bad_frame_does_not_spend_the_force_the_caller_gave_it(tmp_path):
+    """Same rule as a failed call: the one `--force` must not buy a broken result."""
+    target = tmp_path / "shot.png"
+    target.write_text("precious")
+    with pytest.raises(StudioMcpError, match="signature mismatch"):
+        save_images([PNG_IMAGE, MISLABELLED_IMAGE], "screen_capture", target, force=True)
+    assert target.read_text() == "precious", "the named path was overwritten for a failed result"
+
+
+def test_a_hard_linked_out_path_is_refused_rather_than_truncated(tmp_path):
+    """Truncating one name of a shared inode rewrites the file under every other name."""
+    target = tmp_path / "shot.png"
+    target.write_text("precious")
+    twin = tmp_path / "same-file.png"
+    os.link(target, twin)
+
+    with pytest.raises(StudioRequestError, match="hard link"):
+        save_images([PNG_IMAGE], "screen_capture", target, force=True)
+    assert twin.read_text() == "precious", "--force reached a file the caller never named"
