@@ -1,0 +1,20 @@
+name: test
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  test:
+    # macOS only: the client selects on pipe file descriptors, which POSIX
+    # supports and Windows does not, and the Studio proxy path is a .app bundle.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[test]"
+      - run: ruff check
+      - run: pytest -q

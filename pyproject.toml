@@ -1,10 +1,10 @@
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling>=1.27"]
 build-backend = "hatchling.build"
 
 [project]
 name = "roblox-studio-cli"
-version = "0.1.0"
+dynamic = ["version"]
 description = "CLI over Roblox Studio's built-in MCP server, for agents and humans"
 readme = "README.md"
 license = "MIT"
@@ -17,10 +17,13 @@ classifiers = [
     "Development Status :: 3 - Alpha",
     "Environment :: Console",
     "Intended Audience :: Developers",
+    "Operating System :: MacOS",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Software Development :: Build Tools",
 ]
 dependencies = [
@@ -30,10 +33,17 @@ dependencies = [
 [project.optional-dependencies]
 test = [
     "pytest",
+    "ruff",
 ]
 
 [project.scripts]
 roblox-studio = "roblox_studio_cli.main:main"
+
+# One source of truth for the version: src/roblox_studio_cli/__init__.py.
+# client.CLIENT_VERSION reads the same value, so the string Studio sees in the
+# MCP handshake cannot drift from the packaged one.
+[tool.hatch.version]
+path = "src/roblox_studio_cli/__init__.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/roblox_studio_cli"]
