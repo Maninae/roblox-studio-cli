@@ -10,13 +10,22 @@ Exit codes are the contract worth protecting, so they are asserted everywhere:
 """
 
 import json
+import os
 from pathlib import Path
 
 import pytest
+from fake_caffeinate import FakeCaffeinate
 from typer.testing import CliRunner
 
+from roblox_studio_cli import display_wake as display_wake_module
 from roblox_studio_cli import main as main_module
-from roblox_studio_cli.main import EXIT_NOT_READY, EXIT_OK, EXIT_REQUEST_ERROR, app
+from roblox_studio_cli.main import (
+    EXIT_NOT_READY,
+    EXIT_OK,
+    EXIT_REQUEST_ERROR,
+    MAX_LUAU_FILE_BYTES,
+    app,
+)
 
 FAKE_SERVER_PATH = Path(__file__).resolve().parent / "fake_studio_mcp_server.py"
 PNG_MAGIC_BYTES = b"\x89PNG\r\n\x1a\n"
@@ -364,3 +373,94 @@ def test_an_ordinary_exit_still_passes_through_the_catch_all(monkeypatch):
     with pytest.raises(SystemExit) as exited:
         main_module.main()
     assert exited.value.code == EXIT_OK
+
+
+@pytest.fixture
+def recorded_caffeinate(monkeypatch):
+    """Record every `caffeinate` the wake helper asks for, and launch none of them.
+
+    The seam is `start_caffeinate` rather than `subprocess.Popen`: the client
+    spawns the proxy through the same module object, so patching Popen globally
+    would take the bridge down with it.
+    """
+    launched: list[FakeCaffeinate] = []
+
+    def record(arguments):
+        launched.append(FakeCaffeinate(arguments))
+        return launched[-1]
+
+    monkeypatch.setattr(display_wake_module, "start_caffeinate", record)
+    monkeypatch.setattr(display_wake_module.platform, "system", lambda: "Darwin")
+    return launched
+
+
+def test_a_non_finite_timeout_is_refused_before_it_poisons_a_deadline():
+    """Click parses nan and inf; every comparison against NaN is False after that."""
+    for value in ("nan", "inf", "-inf"):
+        result = invoke(["luau", "print(1)", "--timeout", value])
+        assert result.exit_code == EXIT_REQUEST_ERROR, value
+        assert "finite" in all_output(result), value
+
+
+def test_a_luau_file_that_is_not_a_regular_file_is_refused(tmp_path):
+    """Reading a FIFO blocks forever, and it passes every exists() check on the way."""
+    fifo = tmp_path / "script.luau"
+    os.mkfifo(fifo)
+    result = invoke(["luau", "--file", str(fifo)])
+    assert result.exit_code == EXIT_REQUEST_ERROR
+    assert "not a regular file" in all_output(result)
+
+
+def test_an_oversized_luau_file_is_refused_with_its_size(tmp_path):
+    script = tmp_path / "huge.luau"
+    script.write_bytes(b"-" * (MAX_LUAU_FILE_BYTES + 1))
+    result = invoke(["luau", "--file", str(script)])
+    assert result.exit_code == EXIT_REQUEST_ERROR
+    assert "capped at" in all_output(result)
+
+
+def test_a_capture_that_never_answers_names_the_sleeping_display(tmp_path):
+    """Studio accepts the call and goes quiet, which otherwise reads as a broken bridge."""
+    result = invoke(
+        ["screenshot", "--out", str(tmp_path / "shot.png"), "--timeout", SHORT_TIMEOUT],
+        mode="capture-silent",
+    )
+    assert result.exit_code == EXIT_NOT_READY
+    assert "--wake-display" in all_output(result)
+
+
+def test_the_sleeping_display_hint_is_dropped_once_the_flag_was_used(tmp_path, recorded_caffeinate):
+    """Having already ruled the display out, repeating the advice is noise."""
+    result = invoke(
+        ["screenshot", "--wake-display", "--out", str(tmp_path / "shot.png"),
+         "--timeout", SHORT_TIMEOUT],
+        mode="capture-silent",
+    )
+    assert result.exit_code == EXIT_NOT_READY
+    assert "rerun with --wake-display" not in all_output(result)
+
+
+def test_wake_display_asserts_user_activity_and_holds_the_display(tmp_path, recorded_caffeinate):
+    destination = tmp_path / "capture.png"
+    result = invoke(["screenshot", "--wake-display", "--out", str(destination)])
+    assert result.exit_code == EXIT_OK, all_output(result)
+    assert destination.read_bytes().startswith(PNG_MAGIC_BYTES)
+
+    assert [item.arguments for item in recorded_caffeinate] == [
+        ["-u", "-t", str(display_wake_module.DISPLAY_WAKE_SECONDS)],
+        ["-d"],
+    ]
+    assert all(item.terminated for item in recorded_caffeinate), "a caffeinate was left running"
+
+
+def test_wake_display_off_macos_warns_and_still_captures(tmp_path, monkeypatch):
+    launched = []
+    monkeypatch.setattr(display_wake_module.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(display_wake_module, "start_caffeinate", lambda a: launched.append(a))
+
+    destination = tmp_path / "capture.png"
+    result = invoke(["screenshot", "--wake-display", "--out", str(destination)])
+    assert result.exit_code == EXIT_OK, all_output(result)
+    assert destination.exists()
+    assert "not macOS" in all_output(result)
+    assert launched == [], "caffeinate was launched off macOS"

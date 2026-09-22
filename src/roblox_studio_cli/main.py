@@ -24,6 +24,9 @@ Anything the bridge said reaches the terminal through
 
 import functools
 import json
+import math
+import os
+import stat
 import sys
 import uuid
 from contextlib import contextmanager
@@ -55,9 +58,11 @@ from roblox_studio_cli.discovery import (
     parse_arguments_option,
     wait_for_studio_instances,
 )
+from roblox_studio_cli.display_wake import DISPLAY_ASLEEP_HINT, display_kept_awake
 from roblox_studio_cli.doctor_report import gather_doctor_report, render_doctor_report
 from roblox_studio_cli.errors import (
     StudioMcpError,
+    StudioMcpTimeoutError,
     StudioNotAttachedError,
     StudioNotConnectedError,
     StudioRequestError,
@@ -77,6 +82,9 @@ DEFAULT_LUAU_CONTEXT = "Edit"
 STDIN_SOURCE_MARKER = "-"
 CAPTURE_ID_RANDOM_CHARS = 12
 TOOL_NAME_COLUMN_WIDTH = 26
+# Studio's Luau box is not where a multi-megabyte script belongs, and the write
+# to the proxy is bounded too, so say no here where the message can be useful.
+MAX_LUAU_FILE_BYTES = 8 * 2**20
 
 # Typer's rich traceback renders the frames of an unexpected exception, and with
 # locals enabled it prints the variables in them: on this CLI those hold whole
@@ -96,8 +104,25 @@ ARGS_OPTION = typer.Option(None, "--args", help="Extra tool arguments as a JSON 
 JSON_OPTION = typer.Option(
     False, "--json", help="Print machine-readable JSON instead of formatted text."
 )
+
+
+def validate_timeout_seconds(value: float) -> float:
+    """Reject a `--timeout` that is not a real number of seconds.
+
+    Click parses "nan" and "inf" happily, and both poison every deadline built
+    from them: every comparison against NaN is False, so the read loop neither
+    times out nor proceeds.
+    """
+    if not math.isfinite(value):
+        raise typer.BadParameter("--timeout must be a finite number of seconds")
+    return value
+
+
 CALL_TIMEOUT_OPTION = typer.Option(
-    DEFAULT_CALL_TOOL_TIMEOUT_SECONDS, "--timeout", help="Seconds to wait for the result."
+    DEFAULT_CALL_TOOL_TIMEOUT_SECONDS,
+    "--timeout",
+    help="Seconds to wait for the result.",
+    callback=validate_timeout_seconds,
 )
 FORCE_OPTION = typer.Option(False, "--force", help="Overwrite the --out file if it exists.")
 
@@ -207,6 +232,7 @@ def read_luau_source(code: Optional[str], file_path: Optional[Path]) -> str:
     if file_path is not None:
         if code:
             raise StudioRequestError("pass Luau source as an argument or with --file, not both")
+        check_luau_file_is_readable_and_bounded(file_path)
         try:
             return file_path.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError) as read_error:
@@ -220,12 +246,38 @@ def read_luau_source(code: Optional[str], file_path: Optional[Path]) -> str:
     return code
 
 
+def check_luau_file_is_readable_and_bounded(file_path: Path) -> None:
+    """Refuse a `--file` that is not an ordinary, reasonably sized source file.
+
+    A FIFO or a device passes an `exists()` check and then blocks the read
+    forever, and a huge file is a slow way to discover that the request will not
+    fit down the pipe anyway.
+    """
+    try:
+        status = os.stat(file_path)
+    except OSError as stat_error:
+        raise StudioRequestError(f"cannot read {file_path}: {stat_error}") from stat_error
+    if not stat.S_ISREG(status.st_mode):
+        raise StudioRequestError(
+            f"{file_path} is not a regular file (reading a FIFO or device would block); "
+            "--file takes a Luau source file"
+        )
+    if status.st_size > MAX_LUAU_FILE_BYTES:
+        raise StudioRequestError(
+            f"{file_path} is {status.st_size} bytes; --file is capped at "
+            f"{MAX_LUAU_FILE_BYTES} bytes. Read it in Studio instead of sending it."
+        )
+
+
 @app.command("doctor")
 @app.command("status", hidden=True)
 @handles_studio_errors
 def doctor(
     timeout: float = typer.Option(
-        DOCTOR_TIMEOUT_SECONDS, "--timeout", help="Seconds to wait for Studio to expose its tools."
+        DOCTOR_TIMEOUT_SECONDS,
+        "--timeout",
+        help="Seconds to wait for Studio to expose its tools.",
+        callback=validate_timeout_seconds,
     ),
     as_json: bool = JSON_OPTION,
 ):
@@ -271,7 +323,10 @@ def instances(timeout: float = CALL_TIMEOUT_OPTION, as_json: bool = JSON_OPTION)
 @handles_studio_errors
 def tools(
     timeout: float = typer.Option(
-        DEFAULT_LIST_TOOLS_TIMEOUT_SECONDS, "--timeout", help="Seconds to wait for tools/list."
+        DEFAULT_LIST_TOOLS_TIMEOUT_SECONDS,
+        "--timeout",
+        help="Seconds to wait for tools/list.",
+        callback=validate_timeout_seconds,
     ),
     as_json: bool = JSON_OPTION,
 ):
@@ -389,6 +444,10 @@ def screenshot(
         None, "--out", help="Where to write the capture (default: a temp file)."
     ),
     force: bool = FORCE_OPTION,
+    wake_display: bool = typer.Option(
+        False, "--wake-display", help="Wake the Mac's display first (macOS; a dark display "
+        "captures nothing)."
+    ),
     args: Optional[str] = ARGS_OPTION,
     studio: Optional[str] = STUDIO_OPTION,
     timeout: float = CALL_TIMEOUT_OPTION,
@@ -398,19 +457,34 @@ def screenshot(
 
     Camera placement is a per-build extra rather than a flag here; pass it
     through, for example `--args '{"camera_position": [0, 20, 40]}'`.
+
+    With the Mac's display asleep, Studio accepts the call and never answers, so
+    a timeout here is quite likely to be that rather than a broken bridge.
+    `--wake-display` rules it out, and a timeout without the flag says so.
     """
     arguments = parse_arguments_option(args)
-    with studio_client() as client:
-        definitions = client.list_tools()
-        match = find_tool(definitions, SCREENSHOT_INTENT)
-        # Studio requires a caller-supplied capture id that nobody could guess,
-        # so generate one rather than making every invocation pass --args.
-        capture_id_argument = find_argument_name(
-            match.tool, CAPTURE_ID_ARGUMENT_NAMES, fall_back_to_required=False
-        )
-        if capture_id_argument is not None:
-            arguments.setdefault(capture_id_argument, generate_capture_id())
-        result = call_discovered_tool(client, definitions, match.tool, arguments, studio, timeout)
+    try:
+        with display_kept_awake(wake_display) as wake_warning:
+            if wake_warning:
+                typer.echo(wake_warning, err=True)
+            with studio_client() as client:
+                definitions = client.list_tools()
+                match = find_tool(definitions, SCREENSHOT_INTENT)
+                # Studio requires a caller-supplied capture id that nobody could
+                # guess, so generate one rather than making every invocation
+                # pass --args.
+                capture_id_argument = find_argument_name(
+                    match.tool, CAPTURE_ID_ARGUMENT_NAMES, fall_back_to_required=False
+                )
+                if capture_id_argument is not None:
+                    arguments.setdefault(capture_id_argument, generate_capture_id())
+                result = call_discovered_tool(
+                    client, definitions, match.tool, arguments, studio, timeout
+                )
+    except StudioMcpTimeoutError as timeout_error:
+        if wake_display:
+            raise
+        raise StudioMcpTimeoutError(f"{timeout_error}\n{DISPLAY_ASLEEP_HINT}") from timeout_error
 
     emit_result(result, match.tool.name, as_json, out, force)
 

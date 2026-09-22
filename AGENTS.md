@@ -14,10 +14,11 @@ Orientation for anyone (human or agent) changing this repo. The README explains 
 | `client.py` | Transport only. Spawn the proxy, run the handshake, frame JSON-RPC over stdin/stdout, drain stderr, reap the child. |
 | `discovery.py` | Which live tool to call, with which arguments, on which Studio instance. Includes the attach poll. |
 | `image_output.py` | Where a returned image lands on disk, and the refusals on the way (traversal, symlink, clobber). |
+| `display_wake.py` | macOS only: wake the display for a capture and hold it awake, because a dark display captures nothing. |
 | `doctor_report.py` | The `doctor` health check: gather the four facts, render them, name the verdict. |
 | `main.py` | Typer commands, output, exit codes. No protocol knowledge. |
 
-Sizes are a budget, not a suggestion: `wc -l src/roblox_studio_cli/*.py` should show nothing over ~500 lines, with `main.py` near 450. When one grows, extract a responsibility you can name in a short phrase, not an arbitrary half.
+Sizes are a budget, not a suggestion: `wc -l src/roblox_studio_cli/*.py` should show nothing over ~600 lines, with `main.py` near 500. When one grows, extract a responsibility you can name in a short phrase, not an arbitrary half.
 
 ## Invariants
 

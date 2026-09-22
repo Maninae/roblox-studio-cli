@@ -36,6 +36,8 @@ What the pipe is doing (the transport's own hazards):
     huge-list      a tools/list answer larger than the whole-list byte budget
     deaf-stdin     answers the handshake, then never reads its stdin again, so a
                    large request fills the pipe buffer and a blocking write hangs
+    capture-silent everything works except the capture, which is accepted and
+                   never answered: what Studio does with the display asleep
 """
 
 import json
@@ -247,10 +249,15 @@ def list_studios_result(mode: str) -> dict:
     return text_result(json.dumps({"studios": studios}))
 
 
-def handle_tools_call(request_id: int, params: dict, mode: str) -> dict:
-    """Route a tool call to its canned answer, mirroring the real result shapes."""
+def handle_tools_call(request_id: int, params: dict, mode: str) -> dict | None:
+    """Route a tool call to its canned answer, or None to answer nothing at all."""
     name = params.get("name")
     arguments = params.get("arguments", {})
+
+    if mode == "capture-silent" and name == "screen_capture":
+        # Studio with the display asleep: the call is accepted and no result
+        # ever arrives, so the client's own timeout is the only thing that ends it.
+        return None
 
     if mode == "malformed":
         # A JSON-RPC error object is supposed to be an object. Some are not.
@@ -364,7 +371,9 @@ def handle_request(message: dict, mode: str) -> None:
             mode,
         )
     elif method == "tools/call":
-        emit(handle_tools_call(request_id, message.get("params", {}), mode), mode)
+        answer = handle_tools_call(request_id, message.get("params", {}), mode)
+        if answer is not None:
+            emit(answer, mode)
     elif method and method.startswith("notifications/"):
         return
     elif request_id is not None:
