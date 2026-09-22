@@ -65,6 +65,11 @@ def test_non_strings_are_stringified_rather_than_raising():
         ("bidi isolate pair", "⁦vis⁩ible", "visible"),
         ("byte order mark", "﻿visible", "visible"),
         ("tag characters", "vis\U000e0041\U000e007fible", "visible"),
+        ("soft hyphen", "vis\u00adible", "visible"),
+        ("line separator", "vis\u2028ible", "visible"),
+        ("paragraph separator", "vis\u2029ible", "visible"),
+        ("Hangul filler", "vis\u3164ible", "visible"),
+        ("Hangul choseong filler", "vis\u115fible", "visible"),
     ],
 )
 def test_invisible_and_reordering_characters_do_not_survive(label, hostile, expected):
@@ -112,3 +117,22 @@ def test_a_folded_multi_line_field_is_capped_too():
     capped = sanitize_diagnostic_line(rows)
     assert "\n" not in capped
     assert len(capped) == MAX_DIAGNOSTIC_TEXT_CHARS
+
+
+def test_a_smear_of_combining_marks_is_trimmed_to_a_readable_stack():
+    """Hundreds of marks on one base character write over the rows above and below.
+
+    No control character, no invisible character: just Mn marks doing what they
+    are for. Three is more than any real script stacks, and what is left still
+    reads as the text it was.
+    """
+    smeared = "a" + "\u0301" * 60 + "b"
+    assert sanitize_terminal_text(smeared) == "a\u0301\u0301\u0301b"
+
+
+def test_real_diacritics_are_left_alone():
+    """Trimming has to be invisible to text that legitimately stacks marks."""
+    assert sanitize_terminal_text("caf\u00e9") == "caf\u00e9", "a precomposed accent"
+    assert sanitize_terminal_text("e\u0301") == "e\u0301", "one decomposed accent"
+    assert sanitize_terminal_text("\u1ec7") == "\u1ec7", "Vietnamese, precomposed"
+    assert sanitize_terminal_text("e\u0323\u0302") == "e\u0323\u0302", "Vietnamese, two marks"
