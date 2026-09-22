@@ -6,14 +6,28 @@ on stdin/stdout, MCP revision 2024-11-05. The tool schemas mirror the real ones
 (every tool except the instance lister takes a required `studio_id`).
 
 It is an executable script rather than a module because `ROBLOX_STUDIO_MCP_BIN`
-holds a single path with no arguments, so the behaviour is selected through the
-`FAKE_STUDIO_MODE` environment variable instead:
+holds a single path with no arguments, so behaviour is selected through the
+`FAKE_STUDIO_MODE` environment variable instead. The modes fall in two groups.
+
+What Studio is doing:
 
     connected      one registered Studio instance (the default)
-    no-instances   tools work, but no Studio has registered
+    no-instances   tools work, but no Studio ever registers
     two-instances  two registered instances, so a target must be named
     no-tools       answers initialize, then never answers tools/list and logs
                    the same WARN the real proxy logs when Studio is not enabled
+    attach-late    the lister errors twice, returns an empty list once, then the
+                   instance: what a real fresh session does for its first ~3 s
+    attach-never   the lister keeps erroring, so the attach window expires
+
+What the pipe is doing (the transport's own hazards):
+
+    chatty         notifications interleaved with responses, and a notification
+                   plus its response delivered in a single write
+    partial        one response split mid-JSON across two writes with a delay
+    noisy-stderr   one 200 KB stderr line before answering, then a normal line
+    malformed      a non-object JSON frame on stdout, a tools/list entry with a
+                   numeric name, and a JSON-RPC error that is a bare string
 """
 
 import json
@@ -31,6 +45,16 @@ NO_TOOLS_WARNING = (
     "Timed out waiting for tools to become available"
 )
 NO_TOOLS_WARNING_DELAY_SECONDS = 0.2
+
+# Studio 0.739's own wording while it has not attached to this client yet.
+NOT_ATTACHED_ERROR_TEXT = (
+    "Unable to reach Roblox Studio right now. Ask the user to confirm Studio is open."
+)
+ATTACH_ERROR_POLLS = 2
+ATTACH_EMPTY_POLLS = 1
+
+OVERLONG_STDERR_LINE_BYTES = 200_000
+PARTIAL_WRITE_DELAY_SECONDS = 0.1
 
 # 1x1 transparent PNG, small enough to inline and still a real decodable image.
 ONE_PIXEL_PNG_BASE64 = (
@@ -114,10 +138,37 @@ INSTANCES_BY_MODE = {
     ],
 }
 
+NOTIFICATIONS = [
+    {"jsonrpc": "2.0", "method": "notifications/tools/list_changed"},
+    {
+        "jsonrpc": "2.0",
+        "method": "notifications/message",
+        "params": {"level": "info", "data": "still working"},
+    },
+]
 
-def write_message(message: dict) -> None:
-    """Emit one JSON-RPC message as a single newline-terminated line."""
-    sys.stdout.write(json.dumps(message) + "\n")
+lister_call_count = 0
+
+
+def emit(message: dict, mode: str) -> None:
+    """Put one JSON-RPC message on stdout the way `mode` says to put it there."""
+    line = json.dumps(message) + "\n"
+    if mode == "chatty":
+        # Notifications first, and deliberately in the SAME write as the response:
+        # a client that reads with select() must not strand the second frame.
+        preamble = "".join(json.dumps(note) + "\n" for note in NOTIFICATIONS)
+        sys.stdout.write(preamble + line)
+        sys.stdout.flush()
+        return
+    if mode == "partial":
+        split_at = len(line) // 2
+        sys.stdout.write(line[:split_at])
+        sys.stdout.flush()
+        time.sleep(PARTIAL_WRITE_DELAY_SECONDS)
+        sys.stdout.write(line[split_at:])
+        sys.stdout.flush()
+        return
+    sys.stdout.write(line)
     sys.stdout.flush()
 
 
@@ -126,18 +177,14 @@ def text_result(text: str, is_error: bool = False) -> dict:
     return {"content": [{"type": "text", "text": text}], "isError": is_error}
 
 
-def handle_tools_list(request_id: int, params: dict) -> dict:
-    """Serve one page of the tool list, with a cursor to the second page."""
+def tools_list_result(params: dict, mode: str) -> dict:
+    """One page of the tool list, with a cursor to the second page."""
+    if mode == "malformed":
+        # A numeric name is not a tool; the client must drop it, not crash.
+        return {"tools": [{"name": 123, "description": "nameless"}, *TOOL_DEFINITIONS]}
     if params.get("cursor") == SECOND_PAGE_CURSOR:
-        return {"jsonrpc": "2.0", "id": request_id, "result": {"tools": TOOL_DEFINITIONS[FIRST_PAGE_SIZE:]}}
-    return {
-        "jsonrpc": "2.0",
-        "id": request_id,
-        "result": {
-            "tools": TOOL_DEFINITIONS[:FIRST_PAGE_SIZE],
-            "nextCursor": SECOND_PAGE_CURSOR,
-        },
-    }
+        return {"tools": TOOL_DEFINITIONS[FIRST_PAGE_SIZE:]}
+    return {"tools": TOOL_DEFINITIONS[:FIRST_PAGE_SIZE], "nextCursor": SECOND_PAGE_CURSOR}
 
 
 def missing_required_arguments(name: str, arguments: dict) -> list[str]:
@@ -149,22 +196,44 @@ def missing_required_arguments(name: str, arguments: dict) -> list[str]:
     return []
 
 
+def list_studios_result(mode: str) -> dict:
+    """Answer the instance lister, replaying the real attach sequence when asked to."""
+    global lister_call_count
+    lister_call_count += 1
+    if mode == "attach-never":
+        return text_result(NOT_ATTACHED_ERROR_TEXT, is_error=True)
+    if mode == "attach-late":
+        if lister_call_count <= ATTACH_ERROR_POLLS:
+            return text_result(NOT_ATTACHED_ERROR_TEXT, is_error=True)
+        if lister_call_count <= ATTACH_ERROR_POLLS + ATTACH_EMPTY_POLLS:
+            return text_result(json.dumps({"studios": []}))
+        return text_result(json.dumps({"studios": INSTANCES_BY_MODE["connected"]}))
+    studios = INSTANCES_BY_MODE.get(mode, INSTANCES_BY_MODE["connected"])
+    return text_result(json.dumps({"studios": studios}))
+
+
 def handle_tools_call(request_id: int, params: dict, mode: str) -> dict:
     """Route a tool call to its canned answer, mirroring the real result shapes."""
     name = params.get("name")
     arguments = params.get("arguments", {})
+
+    if mode == "malformed":
+        # A JSON-RPC error object is supposed to be an object. Some are not.
+        return {"jsonrpc": "2.0", "id": request_id, "error": "boom"}
 
     missing = missing_required_arguments(name, arguments)
     if missing:
         return {
             "jsonrpc": "2.0",
             "id": request_id,
-            "error": {"code": -32602, "message": f"Missing required arguments: {', '.join(missing)}"},
+            "error": {
+                "code": -32602,
+                "message": f"Missing required arguments: {', '.join(missing)}",
+            },
         }
 
     if name == "list_roblox_studios":
-        studios = INSTANCES_BY_MODE.get(mode, INSTANCES_BY_MODE["connected"])
-        result = text_result(json.dumps({"studios": studios}))
+        result = list_studios_result(mode)
     elif name == "execute_luau":
         # Echo the arguments so tests can assert what discovery filled in.
         result = text_result("luau ok: " + json.dumps(arguments, sort_keys=True))
@@ -189,52 +258,76 @@ def handle_tools_call(request_id: int, params: dict, mode: str) -> dict:
     return {"jsonrpc": "2.0", "id": request_id, "result": result}
 
 
+def flood_stderr() -> None:
+    """One line far longer than the client's per-line cap, then an ordinary line."""
+    sys.stderr.write("x" * OVERLONG_STDERR_LINE_BYTES + "\n")
+    sys.stderr.write("2026-09-22T20:26:23.919122Z  INFO StudioMCP: back to normal\n")
+    sys.stderr.flush()
+
+
+def handle_request(message: dict, mode: str) -> None:
+    """Answer one client message according to the selected mode."""
+    method = message.get("method")
+    request_id = message.get("id")
+
+    if method == "initialize":
+        emit(
+            {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "result": {
+                    "protocolVersion": PROTOCOL_VERSION,
+                    "capabilities": {"tools": {"listChanged": True}},
+                    "serverInfo": SERVER_INFO,
+                    "instructions": SERVER_INSTRUCTIONS,
+                },
+            },
+            mode,
+        )
+    elif method == "tools/list":
+        if mode == "no-tools":
+            # What the real proxy does when Studio never attaches: log to
+            # stderr, answer nothing, stay alive.
+            time.sleep(NO_TOOLS_WARNING_DELAY_SECONDS)
+            sys.stderr.write(NO_TOOLS_WARNING + "\n")
+            sys.stderr.flush()
+            return
+        if mode == "noisy-stderr":
+            flood_stderr()
+        if mode == "malformed":
+            # Not a JSON-RPC frame at all; the client must skip it and read on.
+            sys.stdout.write("[1, 2]\n")
+            sys.stdout.flush()
+        emit(
+            {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "result": tools_list_result(message.get("params", {}), mode),
+            },
+            mode,
+        )
+    elif method == "tools/call":
+        emit(handle_tools_call(request_id, message.get("params", {}), mode), mode)
+    elif method and method.startswith("notifications/"):
+        return
+    elif request_id is not None:
+        emit(
+            {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -32601, "message": f"Method not found: {method}"},
+            },
+            mode,
+        )
+
+
 def main() -> None:
     """Read requests until stdin closes, answering according to the selected mode."""
     mode = os.environ.get("FAKE_STUDIO_MODE", "connected")
-
     for line in sys.stdin:
         line = line.strip()
-        if not line:
-            continue
-        message = json.loads(line)
-        method = message.get("method")
-        request_id = message.get("id")
-
-        if method == "initialize":
-            write_message(
-                {
-                    "jsonrpc": "2.0",
-                    "id": request_id,
-                    "result": {
-                        "protocolVersion": PROTOCOL_VERSION,
-                        "capabilities": {"tools": {"listChanged": True}},
-                        "serverInfo": SERVER_INFO,
-                        "instructions": SERVER_INSTRUCTIONS,
-                    },
-                }
-            )
-        elif method == "tools/list":
-            if mode == "no-tools":
-                # What the real proxy does when Studio never attaches: log to
-                # stderr, answer nothing, stay alive.
-                time.sleep(NO_TOOLS_WARNING_DELAY_SECONDS)
-                sys.stderr.write(NO_TOOLS_WARNING + "\n")
-                sys.stderr.flush()
-                continue
-            write_message(handle_tools_list(request_id, message.get("params", {})))
-        elif method == "tools/call":
-            write_message(handle_tools_call(request_id, message.get("params", {}), mode))
-        elif method and method.startswith("notifications/"):
-            continue
-        elif request_id is not None:
-            write_message(
-                {
-                    "jsonrpc": "2.0",
-                    "id": request_id,
-                    "error": {"code": -32601, "message": f"Method not found: {method}"},
-                }
-            )
+        if line:
+            handle_request(json.loads(line), mode)
 
 
 if __name__ == "__main__":

@@ -1,30 +1,48 @@
 """Transport tests for `StudioMcpClient`, against the fake server in this directory.
 
 None of these need Roblox installed. `tests/fake_studio_mcp_server.py` speaks the
-same wire protocol, including the one behaviour that is hardest to get right by
-inspection: a proxy that answers `initialize` and then goes silent on
-`tools/list` because Studio never attached.
+same wire protocol, including the behaviours that are hardest to get right by
+inspection: a proxy that answers `initialize` and then goes silent because
+Studio never attached, notifications sharing a write with a response, a response
+split mid-JSON, a stderr flood, and frames that are malformed outright.
 """
 
+import subprocess
 import sys
 from pathlib import Path
 
 import pytest
 
+from roblox_studio_cli import client as client_module
 from roblox_studio_cli.client import (
+    MAX_MESSAGE_BYTES,
     PROXY_NO_TOOLS_STDERR_MARKER,
     STUDIO_NOT_ENABLED_MESSAGE,
     StudioMcpClient,
+)
+from roblox_studio_cli.errors import (
     StudioMcpError,
     StudioMcpProtocolError,
+    StudioMcpTimeoutError,
     StudioNotConnectedError,
-    parse_tool_call_result,
 )
 
 FAKE_SERVER_PATH = Path(__file__).resolve().parent / "fake_studio_mcp_server.py"
 PNG_MAGIC_BYTES = b"\x89PNG\r\n\x1a\n"
 SILENT_SERVER_TIMEOUT_SECONDS = 2.0
 STUDIO_ID = "studio-1"
+
+# Answers the handshake, then swallows everything else without logging a thing:
+# silence that is NOT the Studio toggle, and must not be reported as the toggle.
+SILENT_AFTER_HANDSHAKE_SCRIPT = (
+    "import json, sys;"
+    "request = json.loads(sys.stdin.readline());"
+    "sys.stdout.write(json.dumps({'jsonrpc': '2.0', 'id': request['id'], 'result': "
+    "{'protocolVersion': '2024-11-05', 'capabilities': {}, "
+    "'serverInfo': {'name': 'Silent', 'version': '0'}}}) + '\\n');"
+    "sys.stdout.flush();"
+    "[sys.stdin.readline() for _ in range(64)]"
+)
 
 
 @pytest.fixture
@@ -85,9 +103,7 @@ def test_call_tool_returns_text(fake_client):
 
 
 def test_call_tool_returns_decodable_image(fake_client):
-    result = fake_client().call_tool(
-        "screen_capture", {"studio_id": STUDIO_ID, "capture_id": "c1"}
-    )
+    result = fake_client().call_tool("screen_capture", {"studio_id": STUDIO_ID, "capture_id": "c1"})
     assert result.text == ""
     assert len(result.images) == 1
     image = result.images[0]
@@ -116,16 +132,70 @@ def test_unknown_tool_raises_protocol_error(fake_client):
     assert "no_such_tool" in raised.value.rpc_message
 
 
+def test_interleaved_notifications_do_not_strand_the_response(fake_client):
+    """chatty mode puts two notifications and the response in ONE write."""
+    tools = fake_client("chatty").list_tools()
+    assert "execute_luau" in [tool.name for tool in tools]
+
+
+def test_response_split_across_two_writes_is_reassembled(fake_client):
+    """partial mode cuts every frame in half mid-JSON, with a pause between."""
+    result = fake_client("partial").call_tool("get_studio_state", {"studio_id": STUDIO_ID})
+    assert "Baseplate" in result.text
+
+
+def test_stderr_flood_neither_wedges_nor_is_kept(fake_client):
+    """A 200 KB stderr line is drained and dropped; the ordinary line after it survives."""
+    client = fake_client("noisy-stderr")
+    assert client.list_tools()
+    recent = client.recent_stderr()
+    assert "back to normal" in recent
+    assert len(recent) < 10_000, "the over-long line was buffered instead of discarded"
+
+
+def test_malformed_frames_are_survivable(fake_client):
+    """A non-object frame, a numeric tool name, and a string `error` member."""
+    client = fake_client("malformed")
+    names = [tool.name for tool in client.list_tools()]
+    assert "execute_luau" in names, "a stray non-object stdout frame broke the read"
+    assert 123 not in names and "123" not in names, "a numeric tool name was accepted"
+
+    with pytest.raises(StudioMcpProtocolError) as raised:
+        client.call_tool("execute_luau", {"studio_id": STUDIO_ID})
+    assert "boom" in str(raised.value)
+
+
+def test_oversized_line_is_refused_instead_of_buffered(fake_client):
+    """The guard that kept a runaway proxy from turning 64 MB into 2.5 GB of RSS."""
+    client = fake_client()
+    client.stdout_buffer = bytearray(b"x" * (MAX_MESSAGE_BYTES + 1))
+    process = client.process
+    with pytest.raises(StudioMcpError, match="no line break"):
+        client.enforce_message_size_limit()
+    assert process.poll() is not None, "the runaway proxy was left running"
+
+
 def test_silent_tools_list_names_the_studio_toggle(fake_client):
-    """The whole point of the client: silence must read as "turn the toggle on"."""
+    """The whole point of the client: silence PLUS the WARN reads as "turn the toggle on"."""
     client = fake_client("no-tools")
     with pytest.raises(StudioNotConnectedError) as raised:
         client.list_tools(timeout=SILENT_SERVER_TIMEOUT_SECONDS)
 
     message = str(raised.value)
     assert STUDIO_NOT_ENABLED_MESSAGE in message
-    assert "Manage MCP Servers" in message
+    assert "MCP Servers" in message
     assert PROXY_NO_TOOLS_STDERR_MARKER in message, "the proxy's own WARN was not surfaced"
+
+
+def test_silence_without_the_warning_stays_a_timeout():
+    """Without the proxy's marker, a timeout is a timeout and must not blame the toggle."""
+    client = StudioMcpClient(command=[sys.executable, "-c", SILENT_AFTER_HANDSHAKE_SCRIPT])
+    try:
+        client.start()
+        with pytest.raises(StudioMcpTimeoutError):
+            client.list_tools(timeout=1.0)
+    finally:
+        client.close()
 
 
 def test_context_manager_reaps_the_process(monkeypatch):
@@ -134,6 +204,24 @@ def test_context_manager_reaps_the_process(monkeypatch):
         process = client.process
         assert client.list_tools()
     assert process.poll() is not None, "the proxy process outlived the context manager"
+    assert client.process is None
+
+
+def test_failed_handshake_does_not_leak_the_child(monkeypatch):
+    """A proxy that never answers `initialize` must still be reaped, not orphaned."""
+    spawned: list[subprocess.Popen] = []
+    real_popen = subprocess.Popen
+
+    def recording_popen(*args, **kwargs):
+        process = real_popen(*args, **kwargs)
+        spawned.append(process)
+        return process
+
+    monkeypatch.setattr(client_module.subprocess, "Popen", recording_popen)
+    client = StudioMcpClient(command=[sys.executable, "-c", "import sys; sys.stdin.read()"])
+    with pytest.raises(StudioMcpTimeoutError):
+        client.start(timeout=0.5)
+    assert spawned and spawned[0].poll() is not None, "the child outlived the failed handshake"
     assert client.process is None
 
 
@@ -155,25 +243,3 @@ def test_missing_binary_names_the_env_override():
     client = StudioMcpClient(command=["/nonexistent/StudioMCP"])
     with pytest.raises(StudioMcpError, match="ROBLOX_STUDIO_MCP_BIN"):
         client.start()
-
-
-def test_parse_tool_call_result_flattens_mixed_content():
-    """Text, image and embedded-resource items all land where callers expect."""
-    result = parse_tool_call_result(
-        {
-            "content": [
-                {"type": "text", "text": "first"},
-                {"type": "image", "data": "Zm9v", "mimeType": "image/png"},
-                {"type": "resource", "resource": {"uri": "x://y", "text": "second"}},
-                {"type": "audio", "data": "ignored"},
-            ],
-            "isError": False,
-        }
-    )
-    assert result.text == "first\nsecond"
-    assert len(result.images) == 1
-    assert result.raw["content"][0]["text"] == "first"
-
-
-def test_parse_tool_call_result_defaults_to_success():
-    assert parse_tool_call_result({}).is_error is False

@@ -1,35 +1,32 @@
 """Minimal MCP client that drives Roblox Studio's built-in MCP proxy over stdio.
 
 Roblox Studio (0.739 and later) ships a proxy binary inside the application
-bundle at `/Applications/RobloxStudio.app/Contents/MacOS/StudioMCP`. It speaks
-the Model Context Protocol (spec revision 2024-11-05) as newline-delimited
-JSON-RPC 2.0 on stdin/stdout. This module spawns it, performs the `initialize`
-handshake, and exposes `list_tools()` / `call_tool()`, so a shell command can
-reach a running Studio without registering an MCP server in an agent runtime.
+bundle at `/Applications/RobloxStudio.app/Contents/MacOS/StudioMCP`, speaking the
+Model Context Protocol (revision 2024-11-05) as newline-delimited JSON-RPC 2.0
+on stdin/stdout. This module spawns it, runs the `initialize` handshake, and
+exposes `list_tools()` / `call_tool()`, so a shell command can reach a running
+Studio without registering an MCP server in an agent runtime.
 
 The proxy is only half the bridge. The other half is Roblox Studio itself: until
 Studio is running, signed in, and has "Enable Studio as MCP server" switched on,
-the proxy answers `initialize` normally but never answers `tools/list`. It logs
-`WARN ... Timed out waiting for tools to become available` on stderr after about
-20 seconds and stays silent on stdout. `list_tools()` turns that silence into a
-`StudioNotConnectedError` carrying the enable-the-toggle instruction, because a
-bare timeout is indistinguishable from a hang and sends the reader hunting in
-the wrong place.
+the proxy answers `initialize` normally but never answers `tools/list`, logging
+one WARN on stderr after about 20 seconds. `list_tools` reads that marker and
+says so; see its docstring.
 
 Design notes worth knowing before editing:
 
 - Tool names and argument keys are NEVER hardcoded. Roblox iterates on this
-  surface; callers discover both from `tools/list` at runtime.
-- stdout is read from the raw fd with `select` and an explicit deadline, not via
-  `readline()` on a buffered text stream. A buffered reader can swallow a second
-  message into Python's internal buffer, after which `select` reports "not
-  ready" and the caller blocks on data it already has.
-- stderr is drained by a daemon thread into a ring buffer. Draining prevents the
-  child blocking on a full pipe, and the ring buffer is what lets errors quote
-  the proxy's own WARN text back to the user.
+  surface; callers discover both from `tools/list` at runtime (see `discovery`).
+- stdout is read from the raw fd with `select` and an explicit deadline, never
+  via `readline()` on a buffered stream: a buffered reader can swallow a second
+  message into Python's own buffer, after which `select` reports "not ready" and
+  the caller blocks on data it already has.
+- Both pipes are bounded (`MAX_MESSAGE_BYTES`, `STDERR_MAX_LINE_BYTES`): a proxy
+  that never sends a newline must not grow this process. See the methods.
+- Anything server-controlled that lands in an exception message goes through
+  `sanitize_terminal_text` first, because those messages get printed.
 """
 
-import base64
 import json
 import logging
 import os
@@ -38,7 +35,22 @@ import subprocess
 import threading
 import time
 from collections import deque
-from dataclasses import dataclass, field
+
+from roblox_studio_cli import __version__
+from roblox_studio_cli.errors import (
+    StudioMcpError,
+    StudioMcpProtocolError,
+    StudioMcpTimeoutError,
+    StudioNotConnectedError,
+)
+from roblox_studio_cli.mcp_payloads import (
+    ToolCallResult,
+    ToolDefinition,
+    build_tool_definitions,
+    parse_tool_call_result,
+    raise_for_rpc_error,
+)
+from roblox_studio_cli.terminal import sanitize_terminal_text
 
 logger = logging.getLogger(__name__)
 
@@ -47,7 +59,7 @@ STUDIO_MCP_BINARY_ENV_VAR = "ROBLOX_STUDIO_MCP_BIN"
 
 MCP_PROTOCOL_VERSION = "2024-11-05"
 CLIENT_NAME = "roblox-studio-cli"
-CLIENT_VERSION = "0.1.0"
+CLIENT_VERSION = __version__
 
 DEFAULT_INITIALIZE_TIMEOUT_SECONDS = 15.0
 DEFAULT_LIST_TOOLS_TIMEOUT_SECONDS = 30.0
@@ -55,6 +67,12 @@ DEFAULT_CALL_TOOL_TIMEOUT_SECONDS = 120.0
 
 STDOUT_POLL_INTERVAL_SECONDS = 0.2
 STDOUT_READ_CHUNK_BYTES = 65536
+# One JSON-RPC line cannot legitimately be this big; a screen capture, the
+# largest thing Studio sends, is a few hundred KB of base64.
+MAX_MESSAGE_BYTES = 64 * 2**20
+STDERR_MAX_LINE_BYTES = 64 * 1024
+# Measured against Studio 0.739: the real proxy exits 0 within 10 ms of stdin
+# EOF, so this grace only ever pays out for a wedged child.
 SHUTDOWN_GRACE_SECONDS = 3.0
 KILL_GRACE_SECONDS = 2.0
 STDERR_RING_BUFFER_LINES = 200
@@ -64,101 +82,9 @@ TOOLS_LIST_PAGE_LIMIT = 50
 
 STUDIO_NOT_ENABLED_MESSAGE = (
     "Studio's MCP server is not enabled. In Roblox Studio: "
-    "Assistant menu > three dots > Manage MCP Servers > Enable Studio as MCP server."
+    "Assistant settings > MCP Servers > Enable Studio as MCP server."
 )
 PROXY_NO_TOOLS_STDERR_MARKER = "Timed out waiting for tools to become available"
-
-MIME_TYPE_TO_FILE_EXTENSION: dict[str, str] = {
-    "image/png": ".png",
-    "image/jpeg": ".jpg",
-    "image/jpg": ".jpg",
-    "image/gif": ".gif",
-    "image/webp": ".webp",
-}
-DEFAULT_IMAGE_FILE_EXTENSION = ".png"
-
-
-class StudioMcpError(Exception):
-    """Base class for every failure raised by this client."""
-
-
-class StudioMcpTimeoutError(StudioMcpError):
-    """The proxy did not answer a request before its deadline."""
-
-
-class StudioNotConnectedError(StudioMcpError):
-    """The proxy is alive but Roblox Studio is not exposing its tools.
-
-    Almost always means the "Enable Studio as MCP server" toggle is off, or
-    Studio is closed or signed out. The message carries the enable instructions.
-    """
-
-
-class StudioMcpProtocolError(StudioMcpError):
-    """The proxy returned a JSON-RPC `error` object (unknown tool, bad args...)."""
-
-    def __init__(self, code: int, message: str, data: object = None):
-        super().__init__(f"JSON-RPC error {code}: {message}")
-        self.code = code
-        self.rpc_message = message
-        self.data = data
-
-
-@dataclass(frozen=True)
-class ToolDefinition:
-    """One entry from `tools/list`: what the tool is called and what it accepts."""
-
-    name: str
-    description: str
-    input_schema: dict
-
-    @property
-    def argument_names(self) -> list[str]:
-        """Every argument key the tool's JSON Schema declares, in schema order."""
-        return list(self.input_schema.get("properties", {}).keys())
-
-    @property
-    def required_argument_names(self) -> list[str]:
-        """The subset of arguments the schema marks required."""
-        required = self.input_schema.get("required", [])
-        return [name for name in required if isinstance(name, str)]
-
-    def property_schema(self, argument_name: str) -> dict:
-        """JSON Schema fragment for one argument, or `{}` when the tool has no such argument."""
-        properties = self.input_schema.get("properties", {})
-        schema = properties.get(argument_name, {})
-        return schema if isinstance(schema, dict) else {}
-
-
-@dataclass(frozen=True)
-class ToolImage:
-    """An `{"type": "image"}` content item from a tool result."""
-
-    mime_type: str
-    data_base64: str
-
-    def decoded_bytes(self) -> bytes:
-        """Raw image bytes. Raises `StudioMcpError` when the payload is not valid base64."""
-        try:
-            return base64.b64decode(self.data_base64, validate=True)
-        except (ValueError, TypeError) as decode_error:
-            raise StudioMcpError(
-                f"tool returned undecodable image data: {decode_error}"
-            ) from decode_error
-
-    def file_extension(self) -> str:
-        """Filename suffix matching the declared MIME type (`.png` when unknown)."""
-        return MIME_TYPE_TO_FILE_EXTENSION.get(self.mime_type.lower(), DEFAULT_IMAGE_FILE_EXTENSION)
-
-
-@dataclass(frozen=True)
-class ToolCallResult:
-    """A flattened `tools/call` result: the text, the images, and the untouched payload."""
-
-    is_error: bool
-    text: str
-    images: list[ToolImage] = field(default_factory=list)
-    raw: dict = field(default_factory=dict)
 
 
 def resolve_studio_binary_path() -> str:
@@ -166,7 +92,9 @@ def resolve_studio_binary_path() -> str:
 
     Defaults to the binary inside RobloxStudio.app. `ROBLOX_STUDIO_MCP_BIN`
     overrides it, which covers a non-standard install location, a Studio update
-    that moves the binary, and pointing the test suite at a fake server.
+    that moves the binary, and pointing the test suite at a fake server. That
+    variable names a program this process then executes with the environment it
+    inherited, so treat it like `GIT_SSH`: set it only in a shell you control.
     """
     override = os.environ.get(STUDIO_MCP_BINARY_ENV_VAR, "").strip()
     return override or DEFAULT_STUDIO_MCP_BINARY_PATH
@@ -177,8 +105,6 @@ class StudioMcpClient:
 
     Usage:
         with StudioMcpClient() as client:
-            for tool in client.list_tools():
-                print(tool.name, tool.argument_names)
             result = client.call_tool("execute_luau", {"code": "return 1 + 1"})
 
     One request is in flight at a time, so responses are matched by id and any
@@ -195,7 +121,8 @@ class StudioMcpClient:
         self.command = list(command) if command else [resolve_studio_binary_path()]
         self.process: subprocess.Popen | None = None
         self.stdout_fd: int | None = None
-        self.stdout_buffer = b""
+        self.stdout_buffer = bytearray()
+        self.stdout_scan_position = 0
         self.pending_messages: deque[dict] = deque()
         self.stderr_lines: deque[str] = deque(maxlen=STDERR_RING_BUFFER_LINES)
         self.stderr_lock = threading.Lock()
@@ -216,7 +143,9 @@ class StudioMcpClient:
         """Spawn the proxy and run the `initialize` + `notifications/initialized` handshake.
 
         Idempotent: calling it again on a started client returns the cached
-        server info without respawning.
+        server info without respawning. Any failure after the spawn tears the
+        child down before propagating, so a failed handshake cannot leave an
+        orphan proxy attached to Studio.
 
         Returns:
             The server's `initialize` result (protocolVersion, capabilities,
@@ -240,25 +169,30 @@ class StudioMcpClient:
                 "to its current path."
             ) from spawn_error
 
-        self.stdout_fd = self.process.stdout.fileno()
-        self.stderr_thread = threading.Thread(
-            target=self.drain_stderr, name="studio-mcp-stderr", daemon=True
-        )
-        self.stderr_thread.start()
+        try:
+            self.stdout_fd = self.process.stdout.fileno()
+            self.stderr_thread = threading.Thread(
+                target=self.drain_stderr, name="studio-mcp-stderr", daemon=True
+            )
+            self.stderr_thread.start()
 
-        result = self.send_request(
-            "initialize",
-            {
-                "protocolVersion": MCP_PROTOCOL_VERSION,
-                "capabilities": {},
-                "clientInfo": {"name": CLIENT_NAME, "version": CLIENT_VERSION},
-            },
-            timeout=timeout,
-        )
-        self.server_info = result.get("serverInfo", {}) or {}
-        self.server_capabilities = result.get("capabilities", {}) or {}
-        self.server_instructions = result.get("instructions", "") or ""
-        self.send_message({"jsonrpc": "2.0", "method": "notifications/initialized"})
+            result = self.send_request(
+                "initialize",
+                {
+                    "protocolVersion": MCP_PROTOCOL_VERSION,
+                    "capabilities": {},
+                    "clientInfo": {"name": CLIENT_NAME, "version": CLIENT_VERSION},
+                },
+                timeout=timeout,
+            )
+            self.server_info = result.get("serverInfo", {}) or {}
+            self.server_capabilities = result.get("capabilities", {}) or {}
+            self.server_instructions = str(result.get("instructions", "") or "")
+            self.send_message({"jsonrpc": "2.0", "method": "notifications/initialized"})
+        except BaseException:
+            self.close()
+            raise
+
         logger.debug("initialized against %s", self.server_info)
         return result
 
@@ -268,8 +202,10 @@ class StudioMcpClient:
         """Every tool Studio currently exposes, following `nextCursor` pagination.
 
         Raises:
-            StudioNotConnectedError: the proxy went silent, which is what it does
-                when Studio is closed or the MCP toggle is off.
+            StudioNotConnectedError: the proxy went silent AND logged its "no
+                tools" WARN, which is what it does when the MCP toggle is off.
+            StudioMcpTimeoutError: silent without that marker, which is an
+                ordinary timeout and must not be reported as the toggle.
         """
         self.require_started()
         tools: list[ToolDefinition] = []
@@ -282,22 +218,19 @@ class StudioMcpClient:
             try:
                 result = self.send_request("tools/list", params, timeout=remaining)
             except StudioMcpTimeoutError as timeout_error:
-                raise self.not_connected_error() from timeout_error
+                if self.studio_reported_no_tools():
+                    raise self.not_connected_error() from timeout_error
+                raise
 
-            for entry in result.get("tools", []):
-                if not isinstance(entry, dict) or "name" not in entry:
-                    continue
-                input_schema = entry.get("inputSchema", {})
-                tools.append(
-                    ToolDefinition(
-                        name=entry["name"],
-                        description=entry.get("description", "") or "",
-                        input_schema=input_schema if isinstance(input_schema, dict) else {},
-                    )
+            entries = result.get("tools", [])
+            if not isinstance(entries, list):
+                raise StudioMcpProtocolError(
+                    code=-1, message="tools/list returned a non-list `tools` member"
                 )
+            tools.extend(build_tool_definitions(entries))
 
             cursor = result.get("nextCursor")
-            if not cursor:
+            if not cursor or not isinstance(cursor, str):
                 return tools
 
         logger.warning(
@@ -334,7 +267,8 @@ class StudioMcpClient:
 
         Raises:
             StudioMcpTimeoutError: no matching response before the deadline.
-            StudioMcpProtocolError: the server answered with an `error` object.
+            StudioMcpProtocolError: the server answered with an `error` object,
+                or with a frame that is not a JSON-RPC response at all.
         """
         self.request_counter += 1
         request_id = self.request_counter
@@ -347,16 +281,13 @@ class StudioMcpClient:
             raise StudioMcpTimeoutError(
                 f"no response to {method!r} within {timeout:.1f}s.{self.stderr_suffix()}"
             )
-        if "error" in response:
-            error = response["error"] or {}
-            raise StudioMcpProtocolError(
-                code=error.get("code", -1),
-                message=error.get("message", "unknown error"),
-                data=error.get("data"),
-            )
+        raise_for_rpc_error(response)
         result = response.get("result")
         if not isinstance(result, dict):
-            raise StudioMcpError(f"{method!r} returned a non-object result: {result!r}")
+            raise StudioMcpProtocolError(
+                code=-1,
+                message=f"{method} returned a non-object result ({type(result).__name__})",
+            )
         return result
 
     def send_message(self, message: dict) -> None:
@@ -366,7 +297,7 @@ class StudioMcpClient:
         try:
             self.process.stdin.write(payload)
             self.process.stdin.flush()
-        except (BrokenPipeError, ValueError) as write_error:
+        except (OSError, ValueError) as write_error:
             raise StudioMcpError(
                 f"the Studio MCP proxy closed its input: {write_error}.{self.stderr_suffix()}"
             ) from write_error
@@ -383,10 +314,7 @@ class StudioMcpClient:
                 return None
             if message.get("id") == request_id:
                 return message
-            if "method" in message:
-                logger.debug("ignoring server-initiated %s", message.get("method"))
-            else:
-                logger.debug("ignoring response for unexpected id %r", message.get("id"))
+            logger.debug("skipping %r while waiting for id %d", message.get("method") or message.get("id"), request_id)
 
     def read_message(self, deadline: float) -> dict | None:
         """Pop the next parsed JSON-RPC message, or `None` once `deadline` passes.
@@ -421,31 +349,83 @@ class StudioMcpClient:
                 )
             self.stdout_buffer += chunk
             self.consume_buffered_lines()
+            self.enforce_message_size_limit()
 
     def consume_buffered_lines(self) -> None:
-        """Split whole lines off the stdout buffer and queue the ones that parse as JSON."""
-        while b"\n" in self.stdout_buffer:
-            raw_line, self.stdout_buffer = self.stdout_buffer.split(b"\n", 1)
-            line = raw_line.strip()
+        """Split whole lines off the stdout buffer and queue the ones that parse as JSON.
+
+        Scanning restarts where the previous scan stopped, so a chunk costs a
+        search of its own bytes rather than of everything buffered so far.
+        """
+        while True:
+            newline_index = self.stdout_buffer.find(b"\n", self.stdout_scan_position)
+            if newline_index < 0:
+                self.stdout_scan_position = len(self.stdout_buffer)
+                return
+            line = bytes(self.stdout_buffer[:newline_index]).strip()
+            del self.stdout_buffer[: newline_index + 1]
+            self.stdout_scan_position = 0
             if not line:
                 continue
             try:
-                self.pending_messages.append(json.loads(line))
+                message = json.loads(line)
             except json.JSONDecodeError:
                 # The proxy occasionally prints non-protocol noise on stdout; it is
                 # not fatal, so log it and keep reading for real messages.
                 logger.debug("skipping non-JSON stdout line: %r", line[:200])
+                continue
+            if not isinstance(message, dict):
+                logger.debug("skipping non-object JSON-RPC frame: %r", line[:200])
+                continue
+            self.pending_messages.append(message)
+
+    def enforce_message_size_limit(self) -> None:
+        """Kill the proxy rather than buffer an unbounded line.
+
+        The buffer holds only the tail after the last newline, so this trips on
+        one absurd message, never on a busy session.
+        """
+        buffered = len(self.stdout_buffer)
+        if buffered <= MAX_MESSAGE_BYTES:
+            return
+        try:
+            self.process.kill()
+            self.process.wait(timeout=KILL_GRACE_SECONDS)
+        except (OSError, subprocess.TimeoutExpired) as kill_error:
+            logger.warning("could not kill the Studio MCP proxy: %s", kill_error)
+        raise StudioMcpError(
+            f"the Studio MCP proxy sent {buffered} bytes with no line break "
+            f"(limit {MAX_MESSAGE_BYTES}); killed it rather than buffer more."
+        )
 
     def drain_stderr(self) -> None:
-        """Thread body: copy the proxy's stderr into a ring buffer, line by line."""
+        """Thread body: copy the proxy's stderr into a ring buffer, line by line.
+
+        Each `readline` is capped, and the remainder of an over-long line is
+        discarded, so a proxy that logs one enormous line cannot grow this
+        process without bound.
+        """
         stderr_stream = self.process.stderr
-        for raw_line in iter(stderr_stream.readline, b""):
-            line = raw_line.decode("utf-8", errors="replace").rstrip()
-            if not line:
-                continue
-            with self.stderr_lock:
-                self.stderr_lines.append(line)
-            logger.debug("StudioMCP stderr: %s", line)
+        try:
+            while True:
+                raw_line = stderr_stream.readline(STDERR_MAX_LINE_BYTES)
+                if not raw_line:
+                    return
+                while not raw_line.endswith(b"\n"):
+                    # Over-long line: drop the remainder rather than buffer it.
+                    extra = stderr_stream.readline(STDERR_MAX_LINE_BYTES)
+                    if not extra:
+                        break
+                    raw_line = extra
+                line = raw_line.decode("utf-8", errors="replace").rstrip()
+                if not line:
+                    continue
+                with self.stderr_lock:
+                    self.stderr_lines.append(line)
+                logger.debug("StudioMCP stderr: %s", line)
+        except (OSError, ValueError):
+            # close() got there first and closed the pipe under us.
+            return
 
     def recent_stderr(self, max_lines: int = STDERR_QUOTE_LINES) -> str:
         """The last few stderr lines the proxy logged, newest last."""
@@ -454,12 +434,12 @@ class StudioMcpClient:
         return "\n".join(lines[-max_lines:])
 
     def stderr_suffix(self) -> str:
-        """Recent stderr formatted for appending to an exception message."""
-        stderr_text = self.recent_stderr()
+        """Recent stderr, sanitised, formatted for appending to an exception message."""
+        stderr_text = sanitize_terminal_text(self.recent_stderr())
         return f"\nProxy stderr:\n{stderr_text}" if stderr_text else ""
 
     def not_connected_error(self) -> StudioNotConnectedError:
-        """Build the "turn the toggle on" error, quoting the proxy's own WARN when present."""
+        """Build the "turn the toggle on" error, quoting the proxy's own WARN."""
         return StudioNotConnectedError(f"{STUDIO_NOT_ENABLED_MESSAGE}{self.stderr_suffix()}")
 
     def studio_reported_no_tools(self) -> bool:
@@ -499,53 +479,22 @@ class StudioMcpClient:
                 process.kill()
                 process.wait()
 
+        # Closing stderr while the drain thread is parked inside readline() on the
+        # same buffered reader blocks on that thread's lock, which is how close()
+        # used to take 90 s. Leave the pipe to the daemon thread unless the drain
+        # has actually finished.
+        drain_finished = True
         if self.stderr_thread is not None:
             self.stderr_thread.join(timeout=KILL_GRACE_SECONDS)
+            drain_finished = not self.stderr_thread.is_alive()
             self.stderr_thread = None
-        try:
-            if process.stderr is not None:
+        if drain_finished and process.stderr is not None:
+            try:
                 process.stderr.close()
-        except OSError:
-            pass
+            except OSError:
+                pass
+
         self.stdout_fd = None
-        self.stdout_buffer = b""
+        self.stdout_buffer = bytearray()
+        self.stdout_scan_position = 0
         self.pending_messages.clear()
-
-
-def parse_tool_call_result(result: dict) -> ToolCallResult:
-    """Flatten an MCP `tools/call` result into text, images, and the raw payload.
-
-    Handles the three 2024-11-05 content shapes: `text`, `image` (base64 plus
-    mimeType), and embedded `resource` (whose `text` member, when present, reads
-    as more text). Unknown content types are ignored rather than fatal, so a
-    future Roblox content type cannot break an otherwise good call.
-    """
-    text_parts: list[str] = []
-    images: list[ToolImage] = []
-
-    for item in result.get("content", []):
-        if not isinstance(item, dict):
-            continue
-        item_type = item.get("type")
-        if item_type == "text":
-            text_parts.append(str(item.get("text", "")))
-        elif item_type == "image":
-            images.append(
-                ToolImage(
-                    mime_type=str(item.get("mimeType", "image/png")),
-                    data_base64=str(item.get("data", "")),
-                )
-            )
-        elif item_type == "resource":
-            resource = item.get("resource", {})
-            if isinstance(resource, dict) and resource.get("text"):
-                text_parts.append(str(resource["text"]))
-        else:
-            logger.debug("ignoring unknown content type %r", item_type)
-
-    return ToolCallResult(
-        is_error=bool(result.get("isError", False)),
-        text="\n".join(text_parts),
-        images=images,
-        raw=result,
-    )
