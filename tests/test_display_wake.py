@@ -19,11 +19,15 @@ from fake_caffeinate import FakeCaffeinate
 from roblox_studio_cli import display_wake
 from roblox_studio_cli.display_wake import (
     CAFFEINATE_BINARY_PATH,
-    DISPLAY_HOLD_MAX_SECONDS,
+    DISPLAY_HOLD_FLOOR_SECONDS,
+    DISPLAY_HOLD_MARGIN_SECONDS,
     DISPLAY_WAKE_SECONDS,
     display_kept_awake,
     start_caffeinate,
 )
+
+SHORT_CALL_SECONDS = 120.0
+LONG_CALL_SECONDS = 600.0
 
 
 def test_start_caffeinate_uses_an_argv_list_and_never_a_shell(monkeypatch):
@@ -48,7 +52,7 @@ def test_a_missing_caffeinate_is_a_warning_and_not_a_failure(monkeypatch):
 
     monkeypatch.setattr(display_wake.subprocess, "Popen", refuse)
     monkeypatch.setattr(display_wake.platform, "system", lambda: "Darwin")
-    with display_kept_awake(True) as warning:
+    with display_kept_awake(True, SHORT_CALL_SECONDS) as warning:
         assert "carrying on" in warning
 
 
@@ -63,11 +67,11 @@ def test_both_assertions_are_held_for_the_block_and_dropped_after(monkeypatch):
     monkeypatch.setattr(display_wake.platform, "system", lambda: "Darwin")
     monkeypatch.setattr(display_wake, "start_caffeinate", record)
 
-    with display_kept_awake(True) as warning:
+    with display_kept_awake(True, SHORT_CALL_SECONDS) as warning:
         assert warning == ""
         assert [item.arguments for item in launched] == [
             ["-u", "-t", str(DISPLAY_WAKE_SECONDS)],
-            ["-d", "-w", str(os.getpid()), "-t", str(DISPLAY_HOLD_MAX_SECONDS)],
+            ["-d", "-w", str(os.getpid()), "-t", str(DISPLAY_HOLD_FLOOR_SECONDS)],
         ]
         assert not any(item.terminated for item in launched), "released before the capture ran"
     assert all(item.terminated for item in launched), "an assertion outlived the command"
@@ -90,7 +94,7 @@ def test_the_hold_is_released_by_the_kernel_when_this_process_dies(monkeypatch):
     monkeypatch.setattr(display_wake.platform, "system", lambda: "Darwin")
     monkeypatch.setattr(display_wake, "start_caffeinate", record)
 
-    with display_kept_awake(True):
+    with display_kept_awake(True, SHORT_CALL_SECONDS):
         hold = launched[-1].arguments
 
     assert "-d" in hold, "the display-sleep assertion is the point of the hold"
@@ -103,5 +107,39 @@ def test_nothing_is_launched_when_the_flag_was_not_passed(monkeypatch):
         raise AssertionError("caffeinate was launched without --wake-display")
 
     monkeypatch.setattr(display_wake, "start_caffeinate", refuse)
-    with display_kept_awake(False) as warning:
+    with display_kept_awake(False, SHORT_CALL_SECONDS) as warning:
         assert warning == ""
+
+
+def test_the_hold_outlasts_the_call_it_is_holding_for(monkeypatch):
+    """A fixed 300 s hold expired mid-capture under a --timeout larger than it.
+
+    The display then slept while Studio was still working on the capture, which
+    is the exact failure --wake-display exists to prevent.
+    """
+    launched: list[FakeCaffeinate] = []
+    monkeypatch.setattr(display_wake.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(display_wake, "start_caffeinate",
+                        lambda arguments: launched.append(FakeCaffeinate(arguments)) or launched[-1])
+
+    with display_kept_awake(True, LONG_CALL_SECONDS):
+        hold = launched[-1].arguments
+
+    held_seconds = int(hold[hold.index("-t") + 1])
+    assert held_seconds == int(LONG_CALL_SECONDS) + DISPLAY_HOLD_MARGIN_SECONDS
+    assert held_seconds > LONG_CALL_SECONDS, "the hold expires before the call it covers"
+
+
+def test_a_caffeinate_that_died_on_launch_is_reported(monkeypatch):
+    """Popen succeeding says the fork worked, not that caffeinate is running.
+
+    A bad flag or a sandbox denial exits within milliseconds, and the capture
+    then goes ahead against a display nothing is holding awake.
+    """
+    monkeypatch.setattr(display_wake.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(display_wake, "start_caffeinate",
+                        lambda arguments: FakeCaffeinate(arguments, returncode=1))
+
+    with display_kept_awake(True, SHORT_CALL_SECONDS) as warning:
+        assert "exited" in warning, warning
+        assert CAFFEINATE_BINARY_PATH in warning

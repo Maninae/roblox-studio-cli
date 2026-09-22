@@ -462,9 +462,9 @@ def screenshot(
     """
     arguments = parse_arguments_option(args)
     try:
-        with display_kept_awake(wake_display) as wake_warning:
-            if wake_warning:
-                typer.echo(wake_warning, err=True)
+        with display_kept_awake(wake_display, timeout) as warning:
+            if warning:
+                typer.echo(warning, err=True)
             with studio_client() as client:
                 definitions = client.list_tools()
                 match = find_tool(definitions, SCREENSHOT_INTENT)

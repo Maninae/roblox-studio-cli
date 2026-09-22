@@ -6,12 +6,20 @@ as the suite runs, so nothing here spawns one.
 
 
 class FakeCaffeinate:
-    """Records the flags it was asked for and whether it was torn down."""
+    """Records the flags it was asked for and whether it was torn down.
 
-    def __init__(self, arguments: list[str]):
+    `returncode` doubles as what `poll()` answers, so a test can hand back a
+    caffeinate that died the moment it launched.
+    """
+
+    def __init__(self, arguments: list[str], returncode: int | None = None):
         self.arguments = list(arguments)
         self.terminated = False
-        self.returncode = None
+        self.returncode = returncode
+
+    def poll(self) -> int | None:
+        """The exit status if it has already exited, None while it is running."""
+        return self.returncode
 
     def terminate(self) -> None:
         self.terminated = True
