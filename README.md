@@ -75,7 +75,7 @@ $ roblox-studio screenshot --wake-display --out /tmp/studio.png
 /tmp/studio.png
 ```
 
-With the Mac's display asleep, Studio accepts the capture and never answers, so the command times out and reads exactly like a broken bridge. `--wake-display` rules that out first (macOS `caffeinate`), and a capture that times out without the flag tells you to try it. Studio also picks the format: when it returns JPEG for an `--out` ending in `.png`, the file keeps the name you asked for and a warning on stderr names the real format, because quietly renaming your path is the worse of the two.
+With the Mac's display asleep, Studio accepts the capture and never answers, so the command times out and reads exactly like a broken bridge. `--wake-display` rules that out first (macOS `caffeinate`), and a capture that times out without the flag tells you to try it. Studio also picks the format: when it returns JPEG for an `--out` ending in `.png`, the file keeps the name you asked for and a warning on stderr names the real format, because quietly renaming your path is the worse of the two. A call the tool reports as failed writes nothing at all, so a failed capture never creates the file and never spends the `--force` you gave it on the copy already there.
 
 `luau` takes its source three ways: as an argument, from a file with `--file script.luau`, or from stdin with `-`. A `--file` is capped at 8 MB and must be an ordinary file.
 

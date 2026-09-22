@@ -195,11 +195,20 @@ def emit_result(
 ) -> None:
     """Print a tool result, save its images, and exit non-zero when the tool failed.
 
+    The failure check comes FIRST, and a failed call writes nothing: a tool that
+    reports `isError` can still attach content, and writing it handed the caller
+    a file for a capture that never happened, having spent the single `--force`
+    they granted on overwriting the good copy that was already there.
+
     Images are written in both output modes, because `--out` is an explicit
     request for the file; `--json` only changes what goes to stdout. A file
     whose contents do not match the extension the caller asked for is reported
     on stderr in both modes, and never renamed.
     """
+    if result.is_error:
+        emit_failed_result(result, as_json)
+        raise typer.Exit(EXIT_NOT_READY)
+
     written = save_images(result.images, tool_name, out_path, force)
     for image in written:
         if image.warning:
@@ -215,8 +224,24 @@ def emit_result(
         if not result.text and not written:
             typer.echo("(tool returned no content)")
 
-    if result.is_error:
-        raise typer.Exit(EXIT_NOT_READY)
+
+def emit_failed_result(result: ToolCallResult, as_json: bool) -> None:
+    """Print what a failing tool said, and say so when that cost the caller a file.
+
+    Nothing has been written by the time this runs, so the second line is the
+    only thing standing between the caller and a `--out` path they believe holds
+    a fresh capture.
+    """
+    if as_json:
+        typer.echo(json.dumps(result.raw, indent=2))
+    else:
+        echo_server_text(result.text or "(the tool reported a failure with no message)")
+    if result.images:
+        typer.echo(
+            f"error: the tool reported a failure, so the {len(result.images)} image(s) "
+            "it returned were not written",
+            err=True,
+        )
 
 
 def generate_capture_id() -> str:

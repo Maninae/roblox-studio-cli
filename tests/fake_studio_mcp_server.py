@@ -40,6 +40,8 @@ What the pipe is doing (the transport's own hazards):
                    large request fills the pipe buffer and a blocking write hangs
     capture-silent everything works except the capture, which is accepted and
                    never answered: what Studio does with the display asleep
+    capture-error  the capture comes back isError, with an image attached: a
+                   failed call that still hands over bytes to write
 """
 
 import json
@@ -293,9 +295,11 @@ def handle_tools_call(request_id: int, params: dict, mode: str) -> dict | None:
     elif name == "start_stop_play":
         result = text_result("play is_start=" + json.dumps(arguments.get("is_start")))
     elif name == "screen_capture":
+        # A failing tool can still attach content, and a client that writes the
+        # file before reading isError hands the caller a picture of nothing.
         result = {
             "content": [{"type": "image", "data": ONE_PIXEL_PNG_BASE64, "mimeType": "image/png"}],
-            "isError": False,
+            "isError": mode == "capture-error",
         }
     elif name == "boom_tool":
         result = text_result("the tool blew up", is_error=True)

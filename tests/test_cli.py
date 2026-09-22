@@ -254,6 +254,24 @@ def test_screenshot_refuses_to_overwrite_without_force(tmp_path):
     assert destination.read_bytes().startswith(PNG_MAGIC_BYTES)
 
 
+def test_a_failed_capture_writes_no_file(tmp_path):
+    """isError means the call failed, whatever content came attached to it."""
+    destination = tmp_path / "capture.png"
+    result = invoke(["screenshot", "--out", str(destination)], mode="capture-error")
+    assert result.exit_code == EXIT_NOT_READY
+    assert not destination.exists(), "a failed call wrote its image anyway"
+    assert "not written" in all_output(result), "the caller was not told the file is missing"
+
+
+def test_a_failed_capture_does_not_spend_the_force_the_caller_gave_it(tmp_path):
+    """`--force` licenses overwriting for a capture that worked, not for one that failed."""
+    destination = tmp_path / "capture.png"
+    destination.write_text("precious")
+    result = invoke(["screenshot", "--out", str(destination), "--force"], mode="capture-error")
+    assert result.exit_code == EXIT_NOT_READY
+    assert destination.read_text() == "precious", "a failed call overwrote the named path"
+
+
 def test_screenshot_into_a_directory_is_a_clean_request_error(tmp_path):
     result = invoke(["screenshot", "--out", str(tmp_path)])
     assert result.exit_code == EXIT_REQUEST_ERROR
