@@ -18,7 +18,7 @@ Orientation for anyone (human or agent) changing this repo. The README explains 
 | `doctor_report.py` | The `doctor` health check: gather the four facts, render them, name the verdict. |
 | `main.py` | Typer commands, output, exit codes. No protocol knowledge. |
 
-Sizes are a budget, not a suggestion: `wc -l src/roblox_studio_cli/*.py` should show nothing over ~600 lines, with `main.py` near 500. When one grows, extract a responsibility you can name in a short phrase, not an arbitrary half.
+Sizes are a budget, not a suggestion: `wc -l src/roblox_studio_cli/*.py` should show nothing over ~600 lines. When one grows, extract a responsibility you can name in a short phrase, not an arbitrary half. `client.py` is the one at the line after the transport hardening, and the split it wants is already visible: the stdout framing (buffer scanning, frame parsing, the id peek, the per-request byte budget) is a nameable job that does not need the process, the handshake or the stderr drain.
 
 ## Invariants
 
@@ -30,11 +30,13 @@ Matching is strict on purpose, because the failure it prevents is calling the wr
 - Outside an exact name hit, the candidate's token set must EQUAL the keyword's. A superset is a different tool. The candidate must also declare one of the intent's expected arguments and must be the only candidate. Two plausible tools is an error naming both.
 - A destructive verb in a name (`delete`, `remove`, `close`, `reset`, `clear`, `stop`, `destroy`, `wipe`) disqualifies the tool from every convenience command, at both tiers. An intent that legitimately destroys something declares that verb in `allowed_destructive_tokens`; play control is the only one, for `start_stop_play`.
 
-**Sanitise everything the bridge said.** Tool output, tool names and descriptions, instance and place names, the proxy's stderr: all of it can carry terminal escape sequences. It reaches a terminal only through `terminal.echo_server_text` or after `sanitize_terminal_text`, never a bare `typer.echo`. `--json` is exempt: `json.dumps` escapes control characters already.
+**Sanitise everything the bridge said.** Tool output, tool names and descriptions, instance and place names, the proxy's stderr: all of it can carry terminal escape sequences, and invisible or reordering Unicode besides. It reaches a terminal only through `terminal.echo_server_text` or after `sanitize_terminal_text`, never a bare `typer.echo`. Anything printed as a fixed-width row or an identifier uses `sanitize_single_line` instead, before it is padded, so a newline cannot forge a second row. `--json` is exempt: `json.dumps` escapes control characters already, and a consumer needs the bytes as sent.
 
 **Never cache a Studio instance id.** Studio attaches to a client a few seconds after it connects, instances open and close between commands, and ids do not survive a Studio restart. `wait_for_studio_instances` polls every 0.5s for up to 12s (bounded by `--timeout`), treating both an empty list and an error from the lister as "not yet".
 
-**Bound both pipes.** stdout is capped at `MAX_MESSAGE_BYTES` (64 MB) with the scan resuming where it stopped; stderr uses a capped `readline` into a ring buffer. A proxy that never sends a newline must not grow this process.
+**Bound both pipes, and never block on either.** A cap on one frame is not a cap on memory, because parsing JSON multiplies size many times over, so stdout has three bounds: `MAX_MESSAGE_BYTES` (8 MB) per frame with the scan resuming where it stopped, a per-request total (`MAX_REQUEST_TOTAL_BYTES`, and `MAX_TOOLS_LIST_TOTAL_BYTES` across all pages of a list), and a rule that a frame over `LARGE_FRAME_BYTES` positively carrying another request's id is dropped unparsed. stderr uses a capped `readline` into a ring buffer, keeping each over-long line's tail. The request write is non-blocking and runs against the same deadline as the read: a proxy that stops reading used to park the process inside `write()` forever once the pipe buffer filled.
+
+**Nothing the bridge sends may surface as a traceback.** A frame that cannot be read raises `StudioMcpProtocolError`; the Typer app has `pretty_exceptions_enable=False` (its rich traceback prints frames, and with locals the server bytes inside them); and `main` catches whatever still escapes and prints one sanitised line with the environment exit code.
 
 ## Exit codes
 
@@ -69,8 +71,14 @@ No Roblox needed: `tests/fake_studio_mcp_server.py` speaks the same wire protoco
 | `partial` | One response split mid-JSON across two writes with a delay. |
 | `noisy-stderr` | A 200 KB stderr line before answering, then an ordinary line. |
 | `malformed` | A non-object stdout frame, a numeric tool name, an `error` member that is a bare string. |
+| `hostile-names` | A tool whose name, description and argument key carry newlines, an OSC escape and invisible Unicode. |
+| `invalid-utf8` | A stdout line that is not decodable UTF-8, then a normal answer. |
+| `stray-flood` | Several 200 KB frames carrying a request id nobody awaits, ahead of the real one. |
+| `huge-list` | A `tools/list` answer larger than the whole-list byte budget. |
+| `deaf-stdin` | Answers the handshake, then never reads stdin again, so a large request fills the pipe. |
+| `capture-silent` | Everything works except the capture, which is accepted and never answered. |
 
-Against real Studio, the end-to-end check is `roblox-studio doctor`, then `state`, then `luau 'return game.Name'`. Expect about three seconds per command: that is Studio attaching, not the CLI being slow.
+Against real Studio, the end-to-end check is `roblox-studio doctor`, then `state`, then `luau 'return game.Name'`, then `screenshot --wake-display`. Expect about three seconds per command: that is Studio attaching, not the CLI being slow. A capture against a sleeping display never answers at all, which is what `--wake-display` is for.
 
 ## Conventions
 

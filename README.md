@@ -68,7 +68,16 @@ Shared flags:
 - `--args '<json>'` adds or overrides arguments on any subcommand, which is the escape hatch when a Studio build wants something the flags do not cover.
 - `--out <path>` plus `--force` on `screenshot` and `call`, for tools that return images.
 
-`luau` takes its source three ways: as an argument, from a file with `--file script.luau`, or from stdin with `-`.
+`screenshot` prints the path it wrote, and two things about it are worth knowing.
+
+```console
+$ roblox-studio screenshot --wake-display --out /tmp/studio.png
+/tmp/studio.png
+```
+
+With the Mac's display asleep, Studio accepts the capture and never answers, so the command times out and reads exactly like a broken bridge. `--wake-display` rules that out first (macOS `caffeinate`), and a capture that times out without the flag tells you to try it. Studio also picks the format: when it returns JPEG for an `--out` ending in `.png`, the file keeps the name you asked for and a warning on stderr names the real format, because quietly renaming your path is the worse of the two.
+
+`luau` takes its source three ways: as an argument, from a file with `--file script.luau`, or from stdin with `-`. A `--file` is capped at 8 MB and must be an ordinary file.
 
 ```bash
 echo 'return #workspace:GetDescendants()' | roblox-studio luau -
@@ -108,9 +117,11 @@ LUAU
 
 Studio's MCP surface is powerful and this CLI gates none of it. Know these three things before pointing an agent at it.
 
-**Everything that comes back is untrusted text.** Tool results, console output, script sources, place and instance names: all of it can be authored by whoever made the place or the asset that was inserted into it. An agent must treat that text as data to report on, never as instructions to follow. The CLI strips terminal control sequences from anything it echoes (OSC clipboard writes, title rewrites, screen clears all reached a terminal before that was added), and `--json` output is escaped by `json.dumps`. Neither of those makes the *content* trustworthy.
+**Everything that comes back is untrusted text.** Tool results, console output, script sources, place and instance names: all of it can be authored by whoever made the place or the asset that was inserted into it. An agent must treat that text as data to report on, never as instructions to follow. The CLI strips terminal control sequences from anything it echoes (OSC clipboard writes, title rewrites, screen clears all reached a terminal before that was added). It also strips the quieter half: invisible and reordering Unicode, meaning zero-width characters, the bidi overrides that reverse how a name renders, the BOM, and the tag block, which can hide a whole sentence inside a tool name that renders as nothing at all. Both passes apply to printed text only, never to `--json`, which is escaped by `json.dumps` and which a consumer needs byte for byte. Neither makes the *content* trustworthy.
 
-**The dangerous tools are one `call` away.** A Studio build exposes tools that reach the network, the account and the machine: `http_get`, `upload_image`, `store_image`, `insert_asset`, `search_asset`, the `generate_*` family, `subagent`, `user_mouse_input`, `user_keyboard_input`, and `execute_luau` in the Server or Client context. `roblox-studio call` will invoke any of them. There is no allowlist, no confirmation prompt, and no dry run. If an agent drives this CLI unattended, the sandbox has to be somewhere else.
+**The dangerous tools are one `call` away.** A Studio build exposes tools that reach the network, the account and the machine: `http_get`, `upload_image`, `store_image`, `insert_asset`, `search_asset`, the `generate_*` family, `subagent`, `user_mouse_input`, `user_keyboard_input`, and `execute_luau` in any context. `--context Edit` is not a sandbox: Edit reaches the same DataModel as Server and Client, it just runs from a different place. `roblox-studio call` will invoke any of them. There is no allowlist, no confirmation prompt, and no dry run. If an agent drives this CLI unattended, the sandbox has to be somewhere else.
+
+**An image is written on a signature check, not a decode.** A returned image reaches disk only when its first bytes match the MIME type the tool declared, which is what stops a shell script arriving labelled `image/png`. That is a check on a handful of bytes and nothing more: it does not prove the file is a valid or safe image, only that it is not something else wearing that name. Around it, `--out` is never followed through a symlink and never written to a FIFO or a device, `--force` licenses the one path you named rather than its `-2` siblings, and a result carrying more than eight images is refused with none of them written.
 
 **`ROBLOX_STUDIO_MCP_BIN` names a program this CLI executes** with the environment it inherited. That is the same class of variable as `GIT_SSH`: set it only in a shell you control, and never from a value that came out of a file, a web page, or a tool result.
 
@@ -118,7 +129,7 @@ Studio's MCP surface is powerful and this CLI gates none of it. Know these three
 
 The Studio proxy binary lives inside the application bundle at `/Applications/RobloxStudio.app/Contents/MacOS/StudioMCP`. Set `ROBLOX_STUDIO_MCP_BIN` if a Studio update moves it. This CLI spawns that binary, speaks MCP revision 2024-11-05 as newline-delimited JSON-RPC 2.0 over stdin and stdout, and shuts it down when the command ends. Studio's own dialog offers a `claude mcp add --transport stdio Roblox_Studio -- ".../StudioMCP"` line for registering that binary with an agent runtime; this CLI is the alternative to that registration, for when you want shell-shaped calls instead.
 
-Tool names and argument keys are never hardcoded. Every run reads `tools/list` and matches intent onto whatever the live server reports, so a rename from `execute_luau` to something else, or from `code` to `source`, keeps working. Matching is on whole name tokens and requires the candidate to declare the argument the job needs, so a `reset_state` cannot answer a request for `state`.
+Tool names and argument keys are never hardcoded. Every run reads `tools/list` and matches intent onto whatever the live server reports, so a restyled name (`executeLuau`, `luau-execute`) or a renamed argument (`code` to `source`) keeps working. Matching is strict in four ways, because the failure it prevents is calling the wrong tool on a live place: whole name tokens rather than substrings, a token set EQUAL to the keyword's rather than merely containing it, a candidate that declares the argument the job needs, and a hard refusal of any name carrying a destructive verb. So `reset_state` cannot answer a request for `state`, and `execute_luau_and_delete_place` cannot answer a request to run Luau. A name that shares no tokens with any keyword is a fallback to `roblox-studio call`, not a guess.
 
 **Studio attaches late, and that is the latency you see.** Connecting to the proxy is instant, but Studio takes a few seconds to register itself with a freshly connected client: measured against 0.739, three consecutive sessions attached at 2.75s, 2.87s and 3.38s, with 1.1s and 10s seen on other runs. Until then the bridge answers with an empty instance list or an "unable to reach Roblox Studio" error, both of which mean "not yet". So every command polls for up to 12 seconds instead of failing on the first answer, and a simple `state` call takes about three seconds end to end. The instance id belongs to the Studio instance rather than to your session, and it does not survive a Studio restart, so nothing about it is cached.
 
@@ -150,7 +161,7 @@ The niche: an agent that already has a Studio open wants shell-shaped calls with
 .venv/bin/ruff check
 ```
 
-The suite runs with no Roblox installed. `tests/fake_studio_mcp_server.py` speaks the same protocol and simulates both what Studio does (one instance open, none, two, the toggle left off, a late attach) and what the pipe does (interleaved notifications, a response split mid-JSON, a stderr flood, malformed frames). `AGENTS.md` has the module map.
+The suite runs with no Roblox installed. `tests/fake_studio_mcp_server.py` speaks the same protocol and simulates three things: what Studio does (one instance open, none, two, the toggle left off, a late attach, a capture that never answers), what the pipe does (interleaved notifications, a response split mid-JSON, a stderr flood, malformed frames), and what a hostile server does (undecodable bytes, names carrying escapes and newlines, a flood of large frames addressed to nobody, a page larger than the byte budget, a proxy that stops reading its stdin). `AGENTS.md` has the module map.
 
 ## License
 
