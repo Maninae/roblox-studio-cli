@@ -9,6 +9,7 @@ Exit codes are the contract worth protecting, so they are asserted everywhere:
 0 success, 1 the environment is not ready, 2 the request was malformed.
 """
 
+import ast
 import json
 import os
 from pathlib import Path
@@ -57,6 +58,36 @@ def all_output(result) -> str:
         # Older Click mixes stderr into output and refuses to serve it separately.
         pass
     return text
+
+
+def test_the_fake_server_stays_runnable_by_a_stock_python_shebang():
+    """These tests hand the CLI a path, so the script's own shebang picks the interpreter.
+
+    `#!/usr/bin/env python3` is Apple's 3.9.6 on a Mac that never installed
+    another Python, and an annotation like `dict | None` is evaluated when the
+    `def` runs: the whole file raises TypeError on import and every test here
+    fails with the fake server "exiting immediately". The package itself
+    requires 3.10, so this guard is on the one file that has to run anywhere.
+    """
+    tree = ast.parse(FAKE_SERVER_PATH.read_text())
+    annotations = []
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            annotations.extend(argument.annotation for argument in node.args.args)
+            annotations.append(node.returns)
+        elif isinstance(node, ast.AnnAssign):
+            annotations.append(node.annotation)
+
+    union_annotations = [
+        ast.unparse(annotation)
+        for annotation in annotations
+        if annotation is not None
+        and any(
+            isinstance(inner, ast.BinOp) and isinstance(inner.op, ast.BitOr)
+            for inner in ast.walk(annotation)
+        )
+    ]
+    assert union_annotations == [], f"3.10-only annotations in the fake server: {union_annotations}"
 
 
 def test_doctor_reports_connected():

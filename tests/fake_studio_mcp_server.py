@@ -9,6 +9,14 @@ It is an executable script rather than a module because `ROBLOX_STUDIO_MCP_BIN`
 holds a single path with no arguments, so behaviour is selected through the
 `FAKE_STUDIO_MODE` environment variable instead. The modes fall in two groups.
 
+That path is launched through this file's own shebang, which is whatever
+`python3` the machine resolves: Apple's stock 3.9.6 on a Mac that never
+installed another one. So this ONE file stays 3.9-compatible, `Optional[dict]`
+rather than `dict | None`, even though the package itself requires 3.10. A
+union annotation is evaluated when the `def` runs, so getting this wrong is not
+a subtle degradation: the file fails to import and every CLI test fails with a
+proxy that "exited immediately". `test_cli.py` guards it.
+
 What Studio is doing:
 
     connected      one registered Studio instance (the default)
@@ -56,6 +64,7 @@ import json
 import os
 import sys
 import time
+from typing import Optional
 
 PROTOCOL_VERSION = "2024-11-05"
 SERVER_INFO = {"name": "FakeRobloxStudio", "version": "1.0.0"}
@@ -307,7 +316,7 @@ def list_studios_result(mode: str) -> dict:
     return text_result(json.dumps({"studios": studios}))
 
 
-def handle_tools_call(request_id: int, params: dict, mode: str) -> dict | None:
+def handle_tools_call(request_id: int, params: dict, mode: str) -> Optional[dict]:
     """Route a tool call to its canned answer, or None to answer nothing at all."""
     name = params.get("name")
     arguments = params.get("arguments", {})
