@@ -82,6 +82,12 @@ def test_initialize_reports_server_info(fake_client):
     assert "Studio MCP Proxy" in client.server_instructions
 
 
+def test_a_server_info_that_is_not_an_object_is_dropped(fake_client):
+    """`result.get("serverInfo", {}) or {}` keeps "x" and 5; both break `.get` later."""
+    client = fake_client("odd-serverinfo")
+    assert client.server_info == {}
+
+
 def test_start_is_idempotent(fake_client):
     client = fake_client()
     process = client.process

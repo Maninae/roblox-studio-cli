@@ -47,6 +47,9 @@ What the pipe is doing (the transport's own hazards):
     crowded        forty extra tools and forty registered instances, so every
                    message that enumerates what the server offers has to stop
                    somewhere
+    odd-serverinfo the handshake names the server with a bare string where the
+                   spec has an object, which is a shape every reader of it has
+                   to survive
 """
 
 import json
@@ -57,6 +60,8 @@ import time
 PROTOCOL_VERSION = "2024-11-05"
 SERVER_INFO = {"name": "FakeRobloxStudio", "version": "1.0.0"}
 SERVER_INSTRUCTIONS = "Studio MCP Proxy - bridges MCP clients with Roblox Studio"
+# A string where the spec has an object: every reader of serverInfo meets it.
+ODD_SERVER_INFO = "x"
 
 # Byte-identical to the real proxy's warning, because the client quotes it back.
 NO_TOOLS_WARNING = (
@@ -242,10 +247,16 @@ def emit(message: dict, mode: str) -> None:
     sys.stdout.flush()
 
 
-def server_info_for(mode: str) -> dict:
-    """What the server calls itself, which is the server's own choice of length."""
+def server_info_for(mode: str):
+    """What the server calls itself: its own choice of length, and of shape.
+
+    The spec says an object with a name and a version. Nothing makes a server
+    send one, so `odd-serverinfo` sends a bare string instead.
+    """
     if mode == "giant-names":
         return {"name": "x" * GIANT_TEXT_CHARS, "version": "v" * GIANT_TEXT_CHARS}
+    if mode == "odd-serverinfo":
+        return ODD_SERVER_INFO
     return SERVER_INFO
 
 

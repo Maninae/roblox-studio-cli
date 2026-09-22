@@ -199,8 +199,13 @@ class StudioMcpClient:
                 },
                 timeout=timeout,
             )
-            self.server_info = result.get("serverInfo", {}) or {}
-            self.server_capabilities = result.get("capabilities", {}) or {}
+            # Both of these are whatever the server sent. `or {}` let a bare
+            # string or a number through, and the next module to call `.get` on
+            # it raised an AttributeError from three layers down.
+            server_info = result.get("serverInfo")
+            capabilities = result.get("capabilities")
+            self.server_info = server_info if isinstance(server_info, dict) else {}
+            self.server_capabilities = capabilities if isinstance(capabilities, dict) else {}
             self.server_instructions = str(result.get("instructions", "") or "")
             self.send_message({"jsonrpc": "2.0", "method": "notifications/initialized"})
         except BaseException:

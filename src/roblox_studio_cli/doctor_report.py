@@ -40,6 +40,9 @@ from roblox_studio_cli.terminal import (
 )
 
 DOCTOR_LABEL_COLUMN_WIDTH = 11
+# The handshake worked and the server described itself in a shape nobody can
+# read. Worth saying out loud, and not worth failing the report over.
+MALFORMED_SERVER_INFO_ROW = "(malformed serverInfo; --json has it as sent)"
 NO_TOOLS_MESSAGE = (
     "Studio answered the handshake but exposes no tools. That is a Studio-side "
     "fault rather than a toggle: reopen the place, or restart Studio."
@@ -52,7 +55,10 @@ class DoctorReport:
 
     binary_path: str
     binary_exists: bool
-    server_info: dict | None = None
+    # Whatever the handshake called serverInfo, kept exactly as sent: an object
+    # in the ordinary case, and `--json` carries whatever it really was. The
+    # renderer is the one place that has to survive the other shapes.
+    server_info: object = None
     tools_available: bool = False
     tool_count: int = 0
     instances: list[StudioInstance] = field(default_factory=list)
@@ -97,7 +103,10 @@ def gather_doctor_report(timeout: float) -> DoctorReport:
     client = StudioMcpClient()
     try:
         handshake = client.start()
-        report.server_info = handshake.get("serverInfo", {})
+        # Kept exactly as sent, including the shapes that are not an object:
+        # `handshake_row` is where reading it safely belongs, and `--json` wants
+        # what the server really answered.
+        report.server_info = handshake.get("serverInfo")
         tool_definitions = client.list_tools(timeout=timeout)
         report.tools_available = True
         report.tool_count = len(tool_definitions)
@@ -129,14 +138,7 @@ def render_doctor_report(report: DoctorReport, as_json: bool) -> None:
     typer.echo(f"{'Binary:':<{width}}{report.binary_path} "
                f"({'found' if report.binary_exists else 'MISSING'})")
 
-    if report.server_info:
-        # The server names itself, and both fields are printed as one row, so
-        # both are folded and capped. `--json` still carries them in full.
-        name = sanitize_diagnostic_line(str(report.server_info.get("name", "unknown")))
-        version = sanitize_diagnostic_line(str(report.server_info.get("version", "?")))
-        typer.echo(f"{'Handshake:':<{width}}{name} {version}")
-    else:
-        typer.echo(f"{'Handshake:':<{width}}no response")
+    typer.echo(f"{'Handshake:':<{width}}{handshake_row(report.server_info)}")
 
     if report.tools_available:
         typer.echo(f"{'Tools:':<{width}}{report.tool_count} available")
@@ -154,6 +156,23 @@ def render_doctor_report(report: DoctorReport, as_json: bool) -> None:
     typer.echo(f"\n{doctor_verdict(report)}")
     if report.problem:
         echo_server_text(report.problem, err=True)
+
+
+def handshake_row(server_info: object) -> str:
+    """What the server called itself, or why that cannot be shown.
+
+    The spec says an object with a name and a version, and nothing makes a
+    server send one: a bare string here used to reach `.get` and take the whole
+    report down with an AttributeError, verdict included. Both fields print as
+    one row, so both are folded and capped; `--json` still carries them in full.
+    """
+    if not server_info:
+        return "no response"
+    if not isinstance(server_info, dict):
+        return MALFORMED_SERVER_INFO_ROW
+    name = sanitize_diagnostic_line(str(server_info.get("name", "unknown")))
+    version = sanitize_diagnostic_line(str(server_info.get("version", "?")))
+    return f"{name} {version}"
 
 
 def doctor_verdict(report: DoctorReport) -> str:

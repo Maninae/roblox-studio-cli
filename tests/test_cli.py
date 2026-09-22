@@ -397,6 +397,20 @@ def test_a_crowd_of_registered_studios_is_listed_only_as_far_as_it_helps():
     assert "studio-39" not in output
 
 
+def test_a_server_info_that_is_not_an_object_still_reaches_a_verdict():
+    """`"serverInfo": "x"` passed `or {}` and then met `.get` two modules later.
+
+    The AttributeError came out through the catch-all, so the report printed
+    three of its four rows and no verdict at all, for a Studio that was fine.
+    """
+    result = invoke(["doctor"], mode="odd-serverinfo")
+    assert result.exit_code == EXIT_OK, all_output(result)
+    output = all_output(result)
+    assert "malformed serverInfo" in output
+    assert "CONNECTED (6 tools, 1 instance)" in output
+    assert "AttributeError" not in output
+
+
 def test_doctor_json_still_carries_the_full_field():
     """--json is for a consumer, not a terminal: it gets the bytes as sent."""
     report = json.loads(invoke(["doctor", "--json"], mode="giant-names").output)
