@@ -6,18 +6,18 @@ Orientation for anyone (human or agent) changing this repo. The README explains 
 
 `src/roblox_studio_cli/`, in dependency order. Nothing imports upward, so the list is also a reading order.
 
-| Module | Lines | Responsibility |
-| --- | --- | --- |
-| `errors.py` | 62 | The exception taxonomy, and the exit code each class maps onto. A leaf, so every layer can raise the same classes. |
-| `terminal.py` | 57 | Strip terminal control sequences out of server-controlled text before echoing it. |
-| `mcp_payloads.py` | 238 | The payload shapes a server answers with: tool definitions, tool results, images, the JSON-RPC error envelope. |
-| `client.py` | 500 | Transport only. Spawn the proxy, run the handshake, frame JSON-RPC over stdin/stdout, drain stderr, reap the child. |
-| `discovery.py` | 472 | Which live tool to call, with which arguments, on which Studio instance. Includes the attach poll. |
-| `image_output.py` | 118 | Where a returned image lands on disk, and the refusals on the way (traversal, symlink, clobber). |
-| `doctor_report.py` | 162 | The `doctor` health check: gather the four facts, render them, name the verdict. |
-| `main.py` | 462 | Typer commands, output, exit codes. No protocol knowledge. |
+| Module | Responsibility |
+| --- | --- |
+| `errors.py` | The exception taxonomy, and the exit code each class maps onto. A leaf, so every layer can raise the same classes. |
+| `terminal.py` | Strip terminal control sequences out of server-controlled text before echoing it. |
+| `mcp_payloads.py` | The payload shapes a server answers with: tool definitions, tool results, images, the JSON-RPC error envelope. |
+| `client.py` | Transport only. Spawn the proxy, run the handshake, frame JSON-RPC over stdin/stdout, drain stderr, reap the child. |
+| `discovery.py` | Which live tool to call, with which arguments, on which Studio instance. Includes the attach poll. |
+| `image_output.py` | Where a returned image lands on disk, and the refusals on the way (traversal, symlink, clobber). |
+| `doctor_report.py` | The `doctor` health check: gather the four facts, render them, name the verdict. |
+| `main.py` | Typer commands, output, exit codes. No protocol knowledge. |
 
-Keep every module under ~500 lines and `main.py` near 450. When one grows, extract a responsibility you can name in a short phrase, not an arbitrary half.
+Sizes are a budget, not a suggestion: `wc -l src/roblox_studio_cli/*.py` should show nothing over ~500 lines, with `main.py` near 450. When one grows, extract a responsibility you can name in a short phrase, not an arbitrary half.
 
 ## Invariants
 
