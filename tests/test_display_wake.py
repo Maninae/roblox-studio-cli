@@ -4,8 +4,14 @@ The behaviour worth pinning is narrow: two processes with the right flags, an
 argv list and no shell, both torn down afterwards, and a warning instead of an
 exception whenever any of that is impossible. A screenshot must not fail because
 a convenience did.
+
+The hold also has to survive this process NOT getting to tear it down. A
+`caffeinate -d` with no exit condition reparents to launchd when the CLI is
+killed, and the Mac then stays awake until somebody notices, so the flags that
+bound it are asserted here rather than left to the `finally`.
 """
 
+import os
 import subprocess
 
 from fake_caffeinate import FakeCaffeinate
@@ -13,6 +19,7 @@ from fake_caffeinate import FakeCaffeinate
 from roblox_studio_cli import display_wake
 from roblox_studio_cli.display_wake import (
     CAFFEINATE_BINARY_PATH,
+    DISPLAY_HOLD_MAX_SECONDS,
     DISPLAY_WAKE_SECONDS,
     display_kept_awake,
     start_caffeinate,
@@ -60,10 +67,35 @@ def test_both_assertions_are_held_for_the_block_and_dropped_after(monkeypatch):
         assert warning == ""
         assert [item.arguments for item in launched] == [
             ["-u", "-t", str(DISPLAY_WAKE_SECONDS)],
-            ["-d"],
+            ["-d", "-w", str(os.getpid()), "-t", str(DISPLAY_HOLD_MAX_SECONDS)],
         ]
         assert not any(item.terminated for item in launched), "released before the capture ran"
     assert all(item.terminated for item in launched), "an assertion outlived the command"
+
+
+def test_the_hold_is_released_by_the_kernel_when_this_process_dies(monkeypatch):
+    """`finally` never runs on SIGKILL, so the hold must not depend on it.
+
+    Without `-w`, a killed CLI leaves `caffeinate -d` reparented to launchd and
+    the display awake indefinitely. `-w <our pid>` makes the kernel drop the
+    assertion however this process ends, and `-t` is the backstop for the case
+    where even that fails.
+    """
+    launched: list[FakeCaffeinate] = []
+
+    def record(arguments):
+        launched.append(FakeCaffeinate(arguments))
+        return launched[-1]
+
+    monkeypatch.setattr(display_wake.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(display_wake, "start_caffeinate", record)
+
+    with display_kept_awake(True):
+        hold = launched[-1].arguments
+
+    assert "-d" in hold, "the display-sleep assertion is the point of the hold"
+    assert hold[hold.index("-w") + 1] == str(os.getpid()), "the hold is not tied to this process"
+    assert int(hold[hold.index("-t") + 1]) > 0, "the hold has no ceiling"
 
 
 def test_nothing_is_launched_when_the_flag_was_not_passed(monkeypatch):

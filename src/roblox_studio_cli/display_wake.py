@@ -10,16 +10,26 @@ Two `caffeinate` processes do the work, and they do different jobs:
 
 - `-u -t 15` asserts user activity, which is what actually turns the display
   back on. It exits on its own after its window.
-- `-d` holds the display-sleep assertion open for as long as the process lives,
-  which here is the duration of the call.
+- `-d -w <our pid> -t 300` holds the display-sleep assertion open for the
+  duration of the call.
 
 Both are launched with an argv list and no shell, and both are torn down when
-the block ends. `caffeinate` missing or refusing to start is a warning, never a
-failure: the capture may well work anyway, and failing the command over a
-convenience would be worse than trying it.
+the block ends. The hold carries two exit conditions anyway, because the
+teardown is the one thing that cannot be relied on: `finally` does not run when
+the CLI is SIGKILLed or its terminal is closed, and a bare `caffeinate -d` then
+reparents to launchd and keeps the Mac's display awake until somebody notices.
+`-w` hands that job to the kernel, which drops the assertion when this process
+exits however it dies, and `-t` is the backstop ceiling if even that fails. Both
+flags are documented in caffeinate(8) and were measured together: a hold started
+with both exited the instant the watched pid did.
+
+`caffeinate` missing or refusing to start is a warning, never a failure: the
+capture may well work anyway, and failing the command over a convenience would
+be worse than trying it.
 """
 
 import logging
+import os
 import platform
 import subprocess
 from contextlib import contextmanager
@@ -29,6 +39,9 @@ logger = logging.getLogger(__name__)
 MACOS_PLATFORM_NAME = "Darwin"
 CAFFEINATE_BINARY_PATH = "/usr/bin/caffeinate"
 DISPLAY_WAKE_SECONDS = 15
+# Longer than any capture can legitimately take (`--timeout` defaults to 120 s),
+# short enough that a hold nothing else released is gone within the hour.
+DISPLAY_HOLD_MAX_SECONDS = 300
 CAFFEINATE_SHUTDOWN_SECONDS = 2.0
 
 DISPLAY_ASLEEP_HINT = (
@@ -56,6 +69,17 @@ def start_caffeinate(arguments: list[str]) -> subprocess.Popen | None:
     except OSError as launch_error:
         logger.debug("could not launch caffeinate %s: %s", arguments, launch_error)
         return None
+
+
+def display_hold_arguments() -> list[str]:
+    """Flags for the hold: prevent display sleep, and end when this process does.
+
+    The `finally` below terminates it on the ordinary path. These two flags cover
+    the paths where nothing of ours runs at all, which is any signal that is not
+    caught: `-w` releases the assertion when the kernel reaps this pid, and `-t`
+    expires it regardless.
+    """
+    return ["-d", "-w", str(os.getpid()), "-t", str(DISPLAY_HOLD_MAX_SECONDS)]
 
 
 def stop_caffeinate(process: subprocess.Popen) -> None:
@@ -86,7 +110,7 @@ def display_kept_awake(requested: bool):
         process
         for process in (
             start_caffeinate(["-u", "-t", str(DISPLAY_WAKE_SECONDS)]),
-            start_caffeinate(["-d"]),
+            start_caffeinate(display_hold_arguments()),
         )
         if process is not None
     ]

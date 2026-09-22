@@ -448,7 +448,7 @@ def test_wake_display_asserts_user_activity_and_holds_the_display(tmp_path, reco
 
     assert [item.arguments for item in recorded_caffeinate] == [
         ["-u", "-t", str(display_wake_module.DISPLAY_WAKE_SECONDS)],
-        ["-d"],
+        ["-d", "-w", str(os.getpid()), "-t", str(display_wake_module.DISPLAY_HOLD_MAX_SECONDS)],
     ]
     assert all(item.terminated for item in recorded_caffeinate), "a caffeinate was left running"
 
