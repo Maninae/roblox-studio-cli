@@ -30,6 +30,8 @@ What the pipe is doing (the transport's own hazards):
                    numeric name, and a JSON-RPC error that is a bare string
     hostile-names  one extra tool whose name, description and argument key carry
                    newlines, an OSC escape and invisible Unicode
+    giant-names    a server that names itself, and its instance, in 100 KB of
+                   perfectly clean text: length as the attack, no escapes needed
     invalid-utf8   a stdout line that is not decodable UTF-8, then a normal answer
     stray-flood    several 200 KB frames carrying a request id nobody awaits,
                    ahead of the first page of the real answer
@@ -66,6 +68,10 @@ NOT_ATTACHED_ERROR_TEXT = (
 )
 ATTACH_ERROR_POLLS = 2
 ATTACH_EMPTY_POLLS = 1
+
+# The real finding was a 6 MB serverInfo name; 100 KB proves the same cap and
+# keeps the suite fast.
+GIANT_TEXT_CHARS = 100_000
 
 OVERLONG_STDERR_LINE_BYTES = 200_000
 PARTIAL_WRITE_DELAY_SECONDS = 0.1
@@ -171,6 +177,7 @@ SECOND_PAGE_CURSOR = "page-2"
 
 INSTANCES_BY_MODE = {
     "connected": [{"id": "studio-1", "name": "Baseplate"}],
+    "giant-names": [{"id": "g" * GIANT_TEXT_CHARS, "name": "n" * GIANT_TEXT_CHARS}],
     "no-instances": [],
     "two-instances": [
         {"id": "studio-1", "name": "Baseplate"},
@@ -210,6 +217,13 @@ def emit(message: dict, mode: str) -> None:
         return
     sys.stdout.write(line)
     sys.stdout.flush()
+
+
+def server_info_for(mode: str) -> dict:
+    """What the server calls itself, which is the server's own choice of length."""
+    if mode == "giant-names":
+        return {"name": "x" * GIANT_TEXT_CHARS, "version": "v" * GIANT_TEXT_CHARS}
+    return SERVER_INFO
 
 
 def text_result(text: str, is_error: bool = False) -> dict:
@@ -368,7 +382,7 @@ def handle_request(message: dict, mode: str) -> None:
                 "result": {
                     "protocolVersion": PROTOCOL_VERSION,
                     "capabilities": {"tools": {"listChanged": True}},
-                    "serverInfo": SERVER_INFO,
+                    "serverInfo": server_info_for(mode),
                     "instructions": SERVER_INSTRUCTIONS,
                 },
             },

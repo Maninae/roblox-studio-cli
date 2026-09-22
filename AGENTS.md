@@ -33,6 +33,8 @@ Matching is strict on purpose, because the failure it prevents is calling the wr
 
 **Sanitise everything the bridge said.** Tool output, tool names and descriptions, instance and place names, the proxy's stderr: all of it can carry terminal escape sequences, and invisible or reordering Unicode besides. It reaches a terminal only through `terminal.echo_server_text` or after `sanitize_terminal_text`, never a bare `typer.echo`. Anything printed as a fixed-width row or an identifier uses `sanitize_single_line` instead, before it is padded, so a newline cannot forge a second row. `--json` is exempt: `json.dumps` escapes control characters already, and a consumer needs the bytes as sent.
 
+**Cap the chrome, never the answer.** Length is an attack on its own: a 6 MB serverInfo name of nothing but "x" carries no control character and still scrolls a report away. So every field the CLI prints AROUND an answer (serverInfo name and version, instance ids and place names, the error the bridge last answered with) goes through `terminal.sanitize_diagnostic_line` or `truncate_display_text` and stops at `MAX_DIAGNOSTIC_TEXT_CHARS`. Tool output is never capped: it is the thing the caller asked for. Neither is `--json`.
+
 **Never cache a Studio instance id.** Studio attaches to a client a few seconds after it connects, instances open and close between commands, and ids do not survive a Studio restart. `wait_for_studio_instances` polls every 0.5s for up to 12s (bounded by `--timeout`), treating both an empty list and an error from the lister as "not yet".
 
 **Bound both pipes, and never block on either.** A cap on one frame is not a cap on memory, because parsing JSON multiplies size many times over, so stdout has three bounds, all of them in `framing`: `MAX_MESSAGE_BYTES` (8 MB) per frame with the scan resuming where it stopped, a per-request total (`MAX_REQUEST_TOTAL_BYTES`, and `MAX_TOOLS_LIST_TOTAL_BYTES` across all pages of a list), and a rule that a frame over `LARGE_FRAME_BYTES` positively carrying another request's id is dropped unparsed. That last rule searches for the AWAITED id first and drops a frame only when it is absent from both windows: a large answer quoting some other id in its payload (a place id, an instance record) is still ours, and dropping it used to cost the caller the entire timeout. stderr uses a capped `readline` into a ring buffer, keeping each over-long line's tail. The request write is non-blocking and runs against the same deadline as the read: a proxy that stops reading used to park the process inside `write()` forever once the pipe buffer filled.
@@ -73,12 +75,14 @@ No Roblox needed: `tests/fake_studio_mcp_server.py` speaks the same wire protoco
 | `noisy-stderr` | A 200 KB stderr line before answering, then an ordinary line. |
 | `malformed` | A non-object stdout frame, a numeric tool name, an `error` member that is a bare string. |
 | `hostile-names` | A tool whose name, description and argument key carry newlines, an OSC escape and invisible Unicode. |
+| `giant-names` | A server that names itself, and its instance, in 100 KB of clean text. |
 | `invalid-utf8` | A stdout line that is not decodable UTF-8, then a normal answer. |
 | `stray-flood` | Several 200 KB frames carrying a request id nobody awaits, ahead of the real one. |
 | `decoy-id` | A large, legitimate answer quoting another id in its payload before its own. |
 | `huge-list` | A `tools/list` answer larger than the whole-list byte budget. |
 | `deaf-stdin` | Answers the handshake, then never reads stdin again, so a large request fills the pipe. |
 | `capture-silent` | Everything works except the capture, which is accepted and never answered. |
+| `capture-error` | The capture comes back `isError` with an image attached. |
 
 Against real Studio, the end-to-end check is `roblox-studio doctor`, then `state`, then `luau 'return game.Name'`, then `screenshot --wake-display`. Expect about three seconds per command: that is Studio attaching, not the CLI being slow. A capture against a sleeping display never answers at all, which is what `--wake-display` is for.
 

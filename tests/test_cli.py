@@ -26,6 +26,7 @@ from roblox_studio_cli.main import (
     MAX_LUAU_FILE_BYTES,
     app,
 )
+from roblox_studio_cli.terminal import MAX_DIAGNOSTIC_TEXT_CHARS
 
 FAKE_SERVER_PATH = Path(__file__).resolve().parent / "fake_studio_mcp_server.py"
 PNG_MAGIC_BYTES = b"\x89PNG\r\n\x1a\n"
@@ -363,6 +364,24 @@ def test_a_hostile_tool_name_cannot_forge_a_row_or_a_verdict():
     assert not any(line.startswith("CONNECTED") for line in lines), "a forged verdict line printed"
     assert "\x1b" not in all_output(result), "an escape sequence reached the terminal"
     assert any("args: argument name" in line for line in lines), lines
+
+
+def test_doctor_caps_the_fields_whose_length_the_server_chooses():
+    """Length is an attack all by itself: 100 KB of clean x scrolls the report away."""
+    result = invoke(["doctor"], mode="giant-names")
+    assert result.exit_code == EXIT_OK, all_output(result)[:500]
+    output = all_output(result)
+
+    assert "..." in output, "nothing was truncated"
+    longest = max(len(line) for line in output.splitlines())
+    assert longest <= MAX_DIAGNOSTIC_TEXT_CHARS * 2 + len("Instances: ") + len(" ()"), longest
+    assert len(output) < 1500, "the server's own text reached the terminal at its own length"
+
+
+def test_doctor_json_still_carries_the_full_field():
+    """--json is for a consumer, not a terminal: it gets the bytes as sent."""
+    report = json.loads(invoke(["doctor", "--json"], mode="giant-names").output)
+    assert len(report["server_info"]["name"]) > MAX_DIAGNOSTIC_TEXT_CHARS
 
 
 def test_the_app_never_renders_a_traceback_or_its_locals():

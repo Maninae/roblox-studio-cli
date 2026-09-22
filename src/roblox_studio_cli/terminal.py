@@ -49,6 +49,14 @@ INVISIBLE_CHARACTER_PATTERN = re.compile(
 # What a row-shaped or one-line-shaped print turns a newline or tab into.
 LINE_BREAK_REPLACEMENT = " "
 LINE_BREAK_PATTERN = re.compile("[\n\t]+")
+# How much DIAGNOSTIC text is worth printing: the server's name and version, an
+# instance id and place name, the error the bridge last answered with. None of
+# those carry meaning past a line or two, and the bridge picks their length: a
+# 6 MB serverInfo name of nothing but "x" scrolled a doctor report off the
+# screen without a single control character in it. Tool OUTPUT is never capped,
+# because that is the thing the caller asked for.
+MAX_DIAGNOSTIC_TEXT_CHARS = 200
+TRUNCATION_MARKER = "..."
 
 
 def sanitize_terminal_text(text: str) -> str:
@@ -74,6 +82,28 @@ def sanitize_single_line(text: str) -> str:
     column alignment and forge what looks like a second entry.
     """
     return LINE_BREAK_PATTERN.sub(LINE_BREAK_REPLACEMENT, sanitize_terminal_text(text)).strip()
+
+
+def truncate_display_text(text: str, limit: int = MAX_DIAGNOSTIC_TEXT_CHARS) -> str:
+    """Cut display text down to `limit` characters, marking that it was cut.
+
+    Apply it AFTER sanitising, never before: a field padded with escape
+    sequences would otherwise spend the budget on characters that are about to
+    be stripped, and arrive truncated for no reason.
+    """
+    if len(text) <= limit:
+        return text
+    return text[: limit - len(TRUNCATION_MARKER)] + TRUNCATION_MARKER
+
+
+def sanitize_diagnostic_line(text: str) -> str:
+    """One-line, sanitised and length-capped, for a server-chosen label or identifier.
+
+    The chrome a report is built from: a server name and version, an instance id
+    and place name, whatever the bridge last said. Use `echo_server_text` for the
+    answer itself, which is never capped.
+    """
+    return truncate_display_text(sanitize_single_line(text))
 
 
 def echo_server_text(text: str, err: bool = False) -> None:

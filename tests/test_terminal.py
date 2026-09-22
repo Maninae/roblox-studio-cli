@@ -7,11 +7,21 @@ carry them, because a place file can contain any bytes at all.
 The second group is the quieter half: characters a terminal does not execute but
 a reader cannot see. A tag-character run is invisible payload inside a tool name,
 and RLO reverses how a filename renders while leaving its bytes alone.
+
+The third is length. Nothing above bounds how MUCH clean text a server can make
+a terminal print, and a 6 MB server name scrolled a report off the screen using
+nothing but the letter x.
 """
 
 import pytest
 
-from roblox_studio_cli.terminal import sanitize_single_line, sanitize_terminal_text
+from roblox_studio_cli.terminal import (
+    MAX_DIAGNOSTIC_TEXT_CHARS,
+    sanitize_diagnostic_line,
+    sanitize_single_line,
+    sanitize_terminal_text,
+    truncate_display_text,
+)
 
 
 @pytest.mark.parametrize(
@@ -74,3 +84,31 @@ def test_single_line_folds_newlines_and_tabs_into_spaces():
     assert sanitize_single_line("a\t\tb") == "a b"
     assert sanitize_single_line("  padded\n") == "padded"
     assert sanitize_single_line("plain") == "plain"
+
+
+def test_short_diagnostic_text_is_left_exactly_as_it_is():
+    """The cap must be invisible at every length a real server name has."""
+    assert truncate_display_text("RobloxStudio 1.0.0") == "RobloxStudio 1.0.0"
+    assert sanitize_diagnostic_line("c2bc0a63-ae87-4dfc-9bc2-a3045924ab06 (Place1)") == (
+        "c2bc0a63-ae87-4dfc-9bc2-a3045924ab06 (Place1)"
+    )
+
+
+def test_a_giant_diagnostic_field_is_cut_with_an_ellipsis():
+    """Measured: a 6 MB serverInfo name was echoed verbatim into the doctor report."""
+    capped = sanitize_diagnostic_line("x" * 6_000_000)
+    assert len(capped) == MAX_DIAGNOSTIC_TEXT_CHARS
+    assert capped.endswith("...")
+
+
+def test_the_cap_applies_after_sanitising_not_before():
+    """Escapes are stripped first, so padding with them cannot smuggle text past the cap."""
+    hostile = "\x1b[31m" * 100 + "visible"
+    assert sanitize_diagnostic_line(hostile) == "visible"
+
+
+def test_a_folded_multi_line_field_is_capped_too():
+    rows = "\n".join(f"forged row {index}" for index in range(500))
+    capped = sanitize_diagnostic_line(rows)
+    assert "\n" not in capped
+    assert len(capped) == MAX_DIAGNOSTIC_TEXT_CHARS

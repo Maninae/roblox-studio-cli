@@ -42,7 +42,11 @@ from dataclasses import dataclass, field
 from roblox_studio_cli.client import DEFAULT_CALL_TOOL_TIMEOUT_SECONDS, StudioMcpClient
 from roblox_studio_cli.errors import StudioNotAttachedError, StudioRequestError
 from roblox_studio_cli.mcp_payloads import ToolDefinition
-from roblox_studio_cli.terminal import sanitize_single_line, sanitize_terminal_text
+from roblox_studio_cli.terminal import (
+    sanitize_diagnostic_line,
+    sanitize_terminal_text,
+    truncate_display_text,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -137,12 +141,14 @@ class StudioInstance:
     def describe(self) -> str:
         """`id (name)` for display, or the bare id when the bridge reported no name.
 
-        Both halves come from the bridge, so both are sanitised onto one line: an
-        id with a newline in it would otherwise forge a second entry in a list
-        the caller is about to choose from.
+        Both halves come from the bridge, so both are sanitised onto one line and
+        capped: an id with a newline in it would otherwise forge a second entry
+        in a list the caller is about to choose from, and a half-megabyte place
+        name would bury the entry next to it. Display only; `identifier` is what
+        gets sent.
         """
-        identifier = sanitize_single_line(self.identifier)
-        rendered = sanitize_single_line(self.name)
+        identifier = sanitize_diagnostic_line(self.identifier)
+        rendered = sanitize_diagnostic_line(self.name)
         return f"{identifier} ({rendered})" if rendered else identifier
 
 
@@ -444,10 +450,15 @@ def wait_for_studio_instances(
 
 
 def attach_failure_message(outcome: StudioAttachOutcome) -> str:
-    """The "no Studio attached" advice, quoting what the bridge last said."""
+    """The "no Studio attached" advice, quoting what the bridge last said.
+
+    The quote keeps its line breaks, because a bridge error can be a short stack,
+    but it is capped: it is a diagnostic aside under the advice that matters, and
+    a server that answers with a megabyte would otherwise push the advice away.
+    """
     if not outcome.last_error_text:
         return NO_STUDIO_INSTANCE_MESSAGE
-    quoted = sanitize_terminal_text(outcome.last_error_text.strip())
+    quoted = truncate_display_text(sanitize_terminal_text(outcome.last_error_text.strip()))
     return f"{NO_STUDIO_INSTANCE_MESSAGE}\nThe bridge last answered: {quoted}"
 
 

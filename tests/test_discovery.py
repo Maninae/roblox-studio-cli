@@ -22,12 +22,15 @@ from roblox_studio_cli.discovery import (
     LIST_INSTANCES_INTENT,
     LUAU_CODE_ARGUMENT_NAMES,
     LUAU_INTENT,
+    NO_STUDIO_INSTANCE_MESSAGE,
     PLAY_INTENT,
     SCREENSHOT_INTENT,
     STUDIO_STATE_INTENT,
+    StudioAttachOutcome,
     StudioInstance,
     ToolDiscoveryError,
     ToolIntent,
+    attach_failure_message,
     check_required_arguments,
     destructive_tokens_in,
     find_argument_name,
@@ -38,6 +41,7 @@ from roblox_studio_cli.discovery import (
     tool_name_tokens,
 )
 from roblox_studio_cli.mcp_payloads import ToolDefinition
+from roblox_studio_cli.terminal import MAX_DIAGNOSTIC_TEXT_CHARS
 
 STRING = {"type": "string"}
 
@@ -301,3 +305,25 @@ def test_instance_ids_are_sanitised_onto_one_line_as_well_as_names():
     hostile = StudioInstance(identifier="studio-1\nstudio-2 (Fake)", name="Place‮eht")
     assert hostile.describe() == "studio-1 studio-2 (Fake) (Placeeht)"
     assert "\n" not in hostile.describe()
+
+
+def test_a_giant_instance_name_is_capped_before_it_is_printed():
+    """An instance name is chrome around an answer, and the bridge chooses its length."""
+    described = StudioInstance(identifier="studio-1", name="n" * 500_000).describe()
+    assert len(described) < MAX_DIAGNOSTIC_TEXT_CHARS * 2
+    assert described.startswith("studio-1 (nnn")
+    assert described.endswith("...)")
+
+
+def test_a_giant_instance_id_is_capped_too():
+    described = StudioInstance(identifier="i" * 500_000, name="").describe()
+    assert len(described) == MAX_DIAGNOSTIC_TEXT_CHARS
+    assert described.endswith("...")
+
+
+def test_the_quoted_bridge_error_is_capped():
+    """The attach advice quotes whatever the lister last said, which can be anything."""
+    outcome = StudioAttachOutcome(last_error_text="e" * 500_000)
+    message = attach_failure_message(outcome)
+    assert "The bridge last answered:" in message
+    assert len(message) < len(NO_STUDIO_INSTANCE_MESSAGE) + MAX_DIAGNOSTIC_TEXT_CHARS + 40

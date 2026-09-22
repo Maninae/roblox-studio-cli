@@ -33,7 +33,11 @@ from roblox_studio_cli.discovery import (
     wait_for_studio_instances,
 )
 from roblox_studio_cli.errors import StudioMcpError, StudioNotConnectedError
-from roblox_studio_cli.terminal import echo_server_text, sanitize_terminal_text
+from roblox_studio_cli.terminal import (
+    echo_server_text,
+    sanitize_diagnostic_line,
+    sanitize_terminal_text,
+)
 
 DOCTOR_LABEL_COLUMN_WIDTH = 11
 NO_TOOLS_MESSAGE = (
@@ -126,8 +130,10 @@ def render_doctor_report(report: DoctorReport, as_json: bool) -> None:
                f"({'found' if report.binary_exists else 'MISSING'})")
 
     if report.server_info:
-        name = sanitize_terminal_text(str(report.server_info.get("name", "unknown")))
-        version = sanitize_terminal_text(str(report.server_info.get("version", "?")))
+        # The server names itself, and both fields are printed as one row, so
+        # both are folded and capped. `--json` still carries them in full.
+        name = sanitize_diagnostic_line(str(report.server_info.get("name", "unknown")))
+        version = sanitize_diagnostic_line(str(report.server_info.get("version", "?")))
         typer.echo(f"{'Handshake:':<{width}}{name} {version}")
     else:
         typer.echo(f"{'Handshake:':<{width}}no response")
