@@ -78,10 +78,15 @@ STDIN_SOURCE_MARKER = "-"
 CAPTURE_ID_RANDOM_CHARS = 12
 TOOL_NAME_COLUMN_WIDTH = 26
 
+# Typer's rich traceback renders the frames of an unexpected exception, and with
+# locals enabled it prints the variables in them: on this CLI those hold whole
+# server-controlled frames. Both are off, and `main` catches what gets that far.
 app = typer.Typer(
     name="roblox-studio",
     help="CLI over Roblox Studio's built-in MCP server, for agents and humans.",
     no_args_is_help=True,
+    pretty_exceptions_enable=False,
+    pretty_exceptions_show_locals=False,
 )
 
 STUDIO_OPTION = typer.Option(
@@ -457,12 +462,23 @@ def play(
 
 
 def main():
-    """Entry point: run the CLI with a catch-all so users never see a raw traceback."""
+    """Entry point: run the CLI with a catch-all so users never see a raw traceback.
+
+    The second clause is the one that matters for anything the bridge sent. A
+    frame this build cannot read should surface as one line, not as a traceback
+    quoting the bytes that caused it; `SystemExit` and `typer.Exit` are not
+    `Exception` subclasses, so an ordinary exit still passes straight through.
+    """
     try:
         app()
     except StudioMcpError as client_error:
         report_error(client_error)
         raise SystemExit(exit_code_for(client_error))
+    except Exception as unexpected_error:
+        echo_server_text(
+            f"error: {type(unexpected_error).__name__}: {unexpected_error}", err=True
+        )
+        raise SystemExit(EXIT_NOT_READY)
 
 
 if __name__ == "__main__":

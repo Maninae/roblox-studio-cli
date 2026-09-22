@@ -15,6 +15,7 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner
 
+from roblox_studio_cli import main as main_module
 from roblox_studio_cli.main import EXIT_NOT_READY, EXIT_OK, EXIT_REQUEST_ERROR, app
 
 FAKE_SERVER_PATH = Path(__file__).resolve().parent / "fake_studio_mcp_server.py"
@@ -335,3 +336,31 @@ def test_a_hostile_tool_name_cannot_forge_a_row_or_a_verdict():
     assert not any(line.startswith("CONNECTED") for line in lines), "a forged verdict line printed"
     assert "\x1b" not in all_output(result), "an escape sequence reached the terminal"
     assert any("args: argument name" in line for line in lines), lines
+
+
+def test_the_app_never_renders_a_traceback_or_its_locals():
+    """A rendered traceback would print the frames, and with locals the bytes inside them."""
+    assert app.pretty_exceptions_enable is False
+    assert app.pretty_exceptions_show_locals is False
+
+
+def test_an_unexpected_exception_becomes_one_sanitised_line(monkeypatch, capsys):
+    """Whatever slips past a command handler exits 1 with a line, not a stack."""
+    def explode():
+        raise RuntimeError("the proxy said \x1b]0;pwned\x07boom")
+
+    monkeypatch.setattr(main_module, "app", explode)
+    with pytest.raises(SystemExit) as exited:
+        main_module.main()
+
+    assert exited.value.code == EXIT_NOT_READY
+    printed = capsys.readouterr().err
+    assert printed.splitlines() == ["error: RuntimeError: the proxy said boom"]
+
+
+def test_an_ordinary_exit_still_passes_through_the_catch_all(monkeypatch):
+    """`typer.Exit` and `SystemExit` are not Exception subclasses, so exit codes survive."""
+    monkeypatch.setattr(main_module, "app", lambda: (_ for _ in ()).throw(SystemExit(EXIT_OK)))
+    with pytest.raises(SystemExit) as exited:
+        main_module.main()
+    assert exited.value.code == EXIT_OK

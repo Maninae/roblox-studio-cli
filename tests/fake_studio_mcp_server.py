@@ -30,6 +30,12 @@ What the pipe is doing (the transport's own hazards):
                    numeric name, and a JSON-RPC error that is a bare string
     hostile-names  one extra tool whose name, description and argument key carry
                    newlines, an OSC escape and invisible Unicode
+    invalid-utf8   a stdout line that is not decodable UTF-8, then a normal answer
+    stray-flood    several 200 KB frames carrying a request id nobody awaits,
+                   ahead of the first page of the real answer
+    huge-list      a tools/list answer larger than the whole-list byte budget
+    deaf-stdin     answers the handshake, then never reads its stdin again, so a
+                   large request fills the pipe buffer and a blocking write hangs
 """
 
 import json
@@ -57,6 +63,15 @@ ATTACH_EMPTY_POLLS = 1
 
 OVERLONG_STDERR_LINE_BYTES = 200_000
 PARTIAL_WRITE_DELAY_SECONDS = 0.1
+
+# Not decodable as UTF-8 in any position, and shaped like a frame otherwise.
+UNDECODABLE_STDOUT_LINE = b'{"jsonrpc": "2.0", "note": "\x80\xfe\x81"}\n'
+STRAY_FRAME_COUNT = 6
+STRAY_FRAME_PAYLOAD_BYTES = 200_000
+STRAY_FRAME_REQUEST_ID = 999_999
+# Over the client's 4 MB whole-list budget, under its 8 MB per-frame cap.
+HUGE_DESCRIPTION_BYTES = 5 * 2**20
+DEAF_SLEEP_SECONDS = 30
 
 # 1x1 transparent PNG, small enough to inline and still a real decodable image.
 ONE_PIXEL_PNG_BASE64 = (
@@ -199,6 +214,9 @@ def tools_list_result(params: dict, mode: str) -> dict:
         return {"tools": [{"name": 123, "description": "nameless"}, *TOOL_DEFINITIONS]}
     if mode == "hostile-names":
         return {"tools": [*TOOL_DEFINITIONS, HOSTILE_NAME_TOOL]}
+    if mode == "huge-list":
+        padded = dict(TOOL_DEFINITIONS[0], description="x" * HUGE_DESCRIPTION_BYTES)
+        return {"tools": [padded]}
     if params.get("cursor") == SECOND_PAGE_CURSOR:
         return {"tools": TOOL_DEFINITIONS[FIRST_PAGE_SIZE:]}
     return {"tools": TOOL_DEFINITIONS[:FIRST_PAGE_SIZE], "nextCursor": SECOND_PAGE_CURSOR}
@@ -275,6 +293,24 @@ def handle_tools_call(request_id: int, params: dict, mode: str) -> dict:
     return {"jsonrpc": "2.0", "id": request_id, "result": result}
 
 
+def write_raw_line(payload: bytes) -> None:
+    """Put bytes on stdout that `json.dumps` could never produce."""
+    sys.stdout.buffer.write(payload)
+    sys.stdout.buffer.flush()
+
+
+def flood_stdout_with_stray_frames() -> None:
+    """Large, well-formed frames answering a request id the client never sent."""
+    for index in range(STRAY_FRAME_COUNT):
+        stray = {
+            "jsonrpc": "2.0",
+            "id": STRAY_FRAME_REQUEST_ID + index,
+            "result": {"padding": "x" * STRAY_FRAME_PAYLOAD_BYTES},
+        }
+        sys.stdout.write(json.dumps(stray) + "\n")
+    sys.stdout.flush()
+
+
 def flood_stderr() -> None:
     """One line far longer than the client's per-line cap, then an ordinary line."""
     sys.stderr.write("x" * OVERLONG_STDERR_LINE_BYTES + "\n")
@@ -311,6 +347,10 @@ def handle_request(message: dict, mode: str) -> None:
             return
         if mode == "noisy-stderr":
             flood_stderr()
+        if mode == "invalid-utf8":
+            write_raw_line(UNDECODABLE_STDOUT_LINE)
+        if mode == "stray-flood" and not message.get("params", {}).get("cursor"):
+            flood_stdout_with_stray_frames()
         if mode == "malformed":
             # Not a JSON-RPC frame at all; the client must skip it and read on.
             sys.stdout.write("[1, 2]\n")
@@ -341,6 +381,12 @@ def handle_request(message: dict, mode: str) -> None:
 def main() -> None:
     """Read requests until stdin closes, answering according to the selected mode."""
     mode = os.environ.get("FAKE_STUDIO_MODE", "connected")
+    if mode == "deaf-stdin":
+        # Answer the handshake, then stop reading. The client's next large write
+        # fills the pipe buffer and has nowhere to go.
+        handle_request(json.loads(sys.stdin.readline()), mode)
+        time.sleep(DEAF_SLEEP_SECONDS)
+        return
     for line in sys.stdin:
         line = line.strip()
         if line:

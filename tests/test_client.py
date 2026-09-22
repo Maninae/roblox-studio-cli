@@ -5,10 +5,17 @@ same wire protocol, including the behaviours that are hardest to get right by
 inspection: a proxy that answers `initialize` and then goes silent because
 Studio never attached, notifications sharing a write with a response, a response
 split mid-JSON, a stderr flood, and frames that are malformed outright.
+
+The last group came out of a pen-test round, and each one used to end in a
+traceback or a hang rather than an error: undecodable bytes, JSON nested past
+the parser's own limits, an integer too long to convert, a flood of large frames
+answering nobody, a page bigger than the whole list is allowed to be, and a
+proxy that accepts a connection and then stops reading its stdin.
 """
 
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -16,6 +23,7 @@ import pytest
 from roblox_studio_cli import client as client_module
 from roblox_studio_cli.client import (
     MAX_MESSAGE_BYTES,
+    MAX_TOOLS_LIST_TOTAL_BYTES,
     PROXY_NO_TOOLS_STDERR_MARKER,
     STUDIO_NOT_ENABLED_MESSAGE,
     StudioMcpClient,
@@ -30,7 +38,9 @@ from roblox_studio_cli.errors import (
 FAKE_SERVER_PATH = Path(__file__).resolve().parent / "fake_studio_mcp_server.py"
 PNG_MAGIC_BYTES = b"\x89PNG\r\n\x1a\n"
 SILENT_SERVER_TIMEOUT_SECONDS = 2.0
+DEAF_SERVER_TIMEOUT_SECONDS = 2.0
 STUDIO_ID = "studio-1"
+STRAY_FRAME_COUNT = 6
 
 # Answers the handshake, then swallows everything else without logging a thing:
 # silence that is NOT the Studio toggle, and must not be reported as the toggle.
@@ -243,3 +253,75 @@ def test_missing_binary_names_the_env_override():
     client = StudioMcpClient(command=["/nonexistent/StudioMCP"])
     with pytest.raises(StudioMcpError, match="ROBLOX_STUDIO_MCP_BIN"):
         client.start()
+
+
+def test_an_undecodable_frame_is_skipped_rather_than_raising_a_traceback(fake_client):
+    """Invalid UTF-8 reached json.loads as bytes and came back as a UnicodeDecodeError."""
+    client = fake_client("invalid-utf8")
+    assert "execute_luau" in [tool.name for tool in client.list_tools()]
+
+
+def test_a_frame_that_exhausts_the_parser_is_a_protocol_error(monkeypatch):
+    """Deeply nested JSON raises RecursionError on 3.10 to 3.13, where json still recurses."""
+    client = StudioMcpClient(command=[sys.executable, str(FAKE_SERVER_PATH)])
+
+    def exhausted(*args, **kwargs):
+        raise RecursionError("maximum recursion depth exceeded")
+
+    monkeypatch.setattr(client_module.json, "loads", exhausted)
+    with pytest.raises(StudioMcpProtocolError, match="cannot read"):
+        client.parse_frame(b"[[[[1]]]]")
+
+
+def test_an_integer_too_long_to_convert_is_a_protocol_error():
+    """Python refuses int() past 4300 digits; the frame must not take the process down."""
+    client = StudioMcpClient(command=[sys.executable, str(FAKE_SERVER_PATH)])
+    with pytest.raises(StudioMcpProtocolError, match="cannot read"):
+        client.parse_frame(b'{"id": ' + b"9" * 5000 + b"}")
+
+
+def test_a_frame_with_no_readable_json_is_skipped_not_fatal():
+    client = StudioMcpClient(command=[sys.executable, str(FAKE_SERVER_PATH)])
+    assert client.parse_frame(b"[1, 2]") is None
+    assert client.parse_frame(b"not json at all") is None
+    assert client.parse_frame(b'{"id": 1}') == {"id": 1}
+
+
+def test_large_frames_for_other_requests_are_dropped_before_they_are_parsed(fake_client):
+    """Six 200 KB frames with stray ids: skipped unparsed, and the real answer still lands."""
+    client = fake_client("stray-flood")
+    assert "execute_luau" in [tool.name for tool in client.list_tools()]
+    assert client.skipped_large_frames == STRAY_FRAME_COUNT
+
+
+def test_a_small_frame_for_another_request_is_still_parsed_and_skipped_normally(fake_client):
+    """The peek is for large frames only; notifications and stray small ids go the old way."""
+    client = fake_client("chatty")
+    assert client.list_tools()
+    assert client.skipped_large_frames == 0
+
+
+def test_one_request_cannot_parse_more_than_its_byte_budget(fake_client):
+    """A 5 MB tools/list stays under the per-frame cap and still must not be parsed."""
+    client = fake_client("huge-list")
+    with pytest.raises(StudioMcpError, match="budget"):
+        client.list_tools(timeout=SILENT_SERVER_TIMEOUT_SECONDS)
+
+
+def test_the_per_frame_cap_is_small_enough_to_bound_memory():
+    """A viewport capture is a few hundred KB; 64 MB per frame bounded nothing."""
+    assert MAX_MESSAGE_BYTES == 8 * 2**20
+    assert MAX_TOOLS_LIST_TOTAL_BYTES < MAX_MESSAGE_BYTES
+
+
+def test_a_server_that_stops_reading_its_input_times_out_instead_of_wedging(fake_client):
+    """A 300 KB request against a deaf proxy used to park in write() past every deadline."""
+    client = fake_client("deaf-stdin")
+    started = time.monotonic()
+    with pytest.raises(StudioMcpTimeoutError, match="stopped reading its input"):
+        client.send_request(
+            "tools/call",
+            {"name": "execute_luau", "arguments": {"code": "x" * 300_000}},
+            timeout=DEAF_SERVER_TIMEOUT_SECONDS,
+        )
+    assert time.monotonic() - started < DEAF_SERVER_TIMEOUT_SECONDS * 3, "the write outlived it"
