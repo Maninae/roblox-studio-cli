@@ -11,14 +11,15 @@ Orientation for anyone (human or agent) changing this repo. The README explains 
 | `errors.py` | The exception taxonomy, and the exit code each class maps onto. A leaf, so every layer can raise the same classes. |
 | `terminal.py` | Strip terminal control sequences out of server-controlled text before echoing it. |
 | `mcp_payloads.py` | The payload shapes a server answers with: tool definitions, tool results, images, the JSON-RPC error envelope. |
-| `client.py` | Transport only. Spawn the proxy, run the handshake, frame JSON-RPC over stdin/stdout, drain stderr, reap the child. |
+| `framing.py` | Stdout bytes to JSON-RPC messages: line buffering, defensive parsing, the byte budgets, the large-frame id peek. Knows nothing of processes. |
+| `client.py` | Process and protocol. Spawn the proxy, run the handshake, write requests, match responses, drain stderr, reap the child. |
 | `discovery.py` | Which live tool to call, with which arguments, on which Studio instance. Includes the attach poll. |
 | `image_output.py` | Where a returned image lands on disk, and the refusals on the way (traversal, symlink, clobber). |
 | `display_wake.py` | macOS only: wake the display for a capture and hold it awake, because a dark display captures nothing. |
 | `doctor_report.py` | The `doctor` health check: gather the four facts, render them, name the verdict. |
 | `main.py` | Typer commands, output, exit codes. No protocol knowledge. |
 
-Sizes are a budget, not a suggestion: `wc -l src/roblox_studio_cli/*.py` should show nothing over ~600 lines. When one grows, extract a responsibility you can name in a short phrase, not an arbitrary half. `client.py` is the one at the line after the transport hardening, and the split it wants is already visible: the stdout framing (buffer scanning, frame parsing, the id peek, the per-request byte budget) is a nameable job that does not need the process, the handshake or the stderr drain.
+Sizes are a budget, not a suggestion: `wc -l src/roblox_studio_cli/*.py` should show nothing over ~600 lines. When one grows, extract a responsibility you can name in a short phrase, not an arbitrary half. `framing.py` came out of `client.py` that way, and the seam it left is worth keeping: framing takes bytes and gives back messages, so a framing bug reproduces by calling `feed()` with a literal, and the client stays the only module that knows there is a child process.
 
 ## Invariants
 
@@ -34,7 +35,7 @@ Matching is strict on purpose, because the failure it prevents is calling the wr
 
 **Never cache a Studio instance id.** Studio attaches to a client a few seconds after it connects, instances open and close between commands, and ids do not survive a Studio restart. `wait_for_studio_instances` polls every 0.5s for up to 12s (bounded by `--timeout`), treating both an empty list and an error from the lister as "not yet".
 
-**Bound both pipes, and never block on either.** A cap on one frame is not a cap on memory, because parsing JSON multiplies size many times over, so stdout has three bounds: `MAX_MESSAGE_BYTES` (8 MB) per frame with the scan resuming where it stopped, a per-request total (`MAX_REQUEST_TOTAL_BYTES`, and `MAX_TOOLS_LIST_TOTAL_BYTES` across all pages of a list), and a rule that a frame over `LARGE_FRAME_BYTES` positively carrying another request's id is dropped unparsed. stderr uses a capped `readline` into a ring buffer, keeping each over-long line's tail. The request write is non-blocking and runs against the same deadline as the read: a proxy that stops reading used to park the process inside `write()` forever once the pipe buffer filled.
+**Bound both pipes, and never block on either.** A cap on one frame is not a cap on memory, because parsing JSON multiplies size many times over, so stdout has three bounds, all of them in `framing`: `MAX_MESSAGE_BYTES` (8 MB) per frame with the scan resuming where it stopped, a per-request total (`MAX_REQUEST_TOTAL_BYTES`, and `MAX_TOOLS_LIST_TOTAL_BYTES` across all pages of a list), and a rule that a frame over `LARGE_FRAME_BYTES` positively carrying another request's id is dropped unparsed. stderr uses a capped `readline` into a ring buffer, keeping each over-long line's tail. The request write is non-blocking and runs against the same deadline as the read: a proxy that stops reading used to park the process inside `write()` forever once the pipe buffer filled.
 
 **Nothing the bridge sends may surface as a traceback.** A frame that cannot be read raises `StudioMcpProtocolError`; the Typer app has `pretty_exceptions_enable=False` (its rich traceback prints frames, and with locals the server bytes inside them); and `main` catches whatever still escapes and prints one sanitised line with the environment exit code.
 

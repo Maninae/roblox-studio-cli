@@ -1,0 +1,159 @@
+"""Unit tests for the stdout frame reader, with no subprocess anywhere in sight.
+
+Framing used to live inside the client, where every one of these behaviours cost
+a spawned fake server to reach. They are pure functions over bytes: hand `feed()`
+a chunk, take messages back, and assert what was parsed, what was skipped, and
+what was charged against the budget.
+
+The hostile cases in here each ended in a traceback or a hang before they were
+handled: undecodable bytes, JSON nested past the parser's own limits, an integer
+too long to convert, and large frames answering a request nobody sent.
+"""
+
+import json
+
+import pytest
+
+from roblox_studio_cli import framing as framing_module
+from roblox_studio_cli.errors import StudioMcpError, StudioMcpProtocolError
+from roblox_studio_cli.framing import (
+    LARGE_FRAME_BYTES,
+    MAX_MESSAGE_BYTES,
+    MAX_TOOLS_LIST_TOTAL_BYTES,
+    StdoutFrameReader,
+)
+
+AWAITED_ID = 7
+OTHER_ID = 999_999
+PADDING_BYTES = LARGE_FRAME_BYTES * 3
+
+
+def drain(reader: StdoutFrameReader) -> list[dict]:
+    """Every message the reader has queued, in order."""
+    messages = []
+    while True:
+        message = reader.next_message()
+        if message is None:
+            return messages
+        messages.append(message)
+
+
+def large_frame(frame: dict) -> bytes:
+    """`frame` padded past the peek threshold, as one newline-terminated line."""
+    padded = dict(frame)
+    padded["result"] = {"padding": "x" * PADDING_BYTES, **padded.get("result", {})}
+    return json.dumps(padded).encode("utf-8") + b"\n"
+
+
+def test_two_frames_in_one_chunk_both_arrive():
+    """A single read carrying two messages must not strand the second one."""
+    reader = StdoutFrameReader()
+    reader.feed(b'{"id": 1}\n{"id": 2}\n')
+    assert drain(reader) == [{"id": 1}, {"id": 2}]
+
+
+def test_a_frame_split_across_two_chunks_is_reassembled():
+    reader = StdoutFrameReader()
+    reader.feed(b'{"id": 1, "resu')
+    assert reader.next_message() is None
+    reader.feed(b'lt": {"ok": true}}\n')
+    assert drain(reader) == [{"id": 1, "result": {"ok": True}}]
+
+
+def test_blank_lines_and_non_object_frames_are_skipped():
+    reader = StdoutFrameReader()
+    reader.feed(b'\n\n[1, 2]\nnot json at all\n{"id": 1}\n')
+    assert drain(reader) == [{"id": 1}]
+
+
+def test_a_frame_with_no_readable_json_is_skipped_not_fatal():
+    reader = StdoutFrameReader()
+    assert reader.parse_frame(b"[1, 2]") is None
+    assert reader.parse_frame(b"not json at all") is None
+    assert reader.parse_frame(b'{"id": 1}') == {"id": 1}
+
+
+def test_an_undecodable_frame_is_skipped_rather_than_raising_a_traceback():
+    """Invalid UTF-8 reached json.loads as bytes and came back as a UnicodeDecodeError."""
+    reader = StdoutFrameReader()
+    reader.feed(b'{"jsonrpc": "2.0", "note": "\x80\xfe\x81"}\n{"id": 1}\n')
+    assert {"id": 1} in drain(reader)
+
+
+def test_a_frame_that_exhausts_the_parser_is_a_protocol_error(monkeypatch):
+    """Deeply nested JSON raises RecursionError on 3.10 to 3.13, where json still recurses."""
+
+    def exhausted(*args, **kwargs):
+        raise RecursionError("maximum recursion depth exceeded")
+
+    monkeypatch.setattr(framing_module.json, "loads", exhausted)
+    with pytest.raises(StudioMcpProtocolError, match="cannot read"):
+        StdoutFrameReader().parse_frame(b"[[[[1]]]]")
+
+
+def test_an_integer_too_long_to_convert_is_a_protocol_error():
+    """Python refuses int() past 4300 digits; the frame must not take the process down."""
+    with pytest.raises(StudioMcpProtocolError, match="cannot read"):
+        StdoutFrameReader().parse_frame(b'{"id": ' + b"9" * 5000 + b"}")
+
+
+def test_a_request_cannot_parse_more_than_its_byte_budget():
+    reader = StdoutFrameReader()
+    reader.begin_request(byte_budget=100)
+    with pytest.raises(StudioMcpError, match="budget"):
+        reader.feed(b'{"id": 1, "pad": "' + b"x" * 200 + b'"}\n')
+
+
+def test_each_request_starts_its_budget_over():
+    reader = StdoutFrameReader()
+    reader.begin_request(byte_budget=100)
+    reader.feed(b'{"id": 1}\n')
+    consumed = reader.bytes_consumed
+    assert consumed > 0
+    reader.begin_request(byte_budget=100)
+    assert reader.bytes_consumed == 0
+
+
+def test_an_unterminated_line_past_the_cap_is_reported_not_buffered():
+    """The guard that kept a runaway proxy from turning 64 MB into 2.5 GB of RSS."""
+    reader = StdoutFrameReader()
+    assert reader.holds_an_oversized_line() is False
+    reader.buffer = bytearray(b"x" * (MAX_MESSAGE_BYTES + 1))
+    assert reader.holds_an_oversized_line() is True
+    assert "no line break" in reader.oversized_line_message()
+
+
+def test_the_per_frame_cap_is_small_enough_to_bound_memory():
+    """A viewport capture is a few hundred KB; 64 MB per frame bounded nothing."""
+    assert MAX_MESSAGE_BYTES == 8 * 2**20
+    assert MAX_TOOLS_LIST_TOTAL_BYTES < MAX_MESSAGE_BYTES
+
+
+def test_a_large_frame_answering_another_request_is_dropped_unparsed():
+    reader = StdoutFrameReader()
+    reader.feed(large_frame({"jsonrpc": "2.0", "id": OTHER_ID}), awaited_id=AWAITED_ID)
+    assert drain(reader) == []
+    assert reader.skipped_large_frames == 1
+    assert reader.bytes_consumed == 0, "a dropped frame was still charged for"
+
+
+def test_a_small_frame_for_another_request_is_parsed_and_left_to_the_caller():
+    """The peek is for large frames only; notifications and stray small ids go the old way."""
+    reader = StdoutFrameReader()
+    reader.feed(b'{"jsonrpc": "2.0", "id": 999999}\n', awaited_id=AWAITED_ID)
+    assert drain(reader) == [{"jsonrpc": "2.0", "id": OTHER_ID}]
+    assert reader.skipped_large_frames == 0
+
+
+def test_a_large_frame_with_no_readable_id_is_parsed_rather_than_guessed_at():
+    reader = StdoutFrameReader()
+    reader.feed(large_frame({"jsonrpc": "2.0", "method": "notifications/message"}),
+                awaited_id=AWAITED_ID)
+    assert len(drain(reader)) == 1
+    assert reader.skipped_large_frames == 0
+
+
+def test_nothing_is_dropped_when_no_request_is_in_flight():
+    reader = StdoutFrameReader()
+    reader.feed(large_frame({"jsonrpc": "2.0", "id": OTHER_ID}), awaited_id=None)
+    assert len(drain(reader)) == 1

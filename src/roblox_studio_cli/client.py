@@ -20,12 +20,12 @@ Design notes worth knowing before editing:
 - stdout is read from the raw fd with `select` and an explicit deadline, never
   via `readline()` on a buffered stream: a buffered reader can swallow a second
   message into Python's own buffer, after which `select` reports "not ready" and
-  the caller blocks on data it already has.
-- Both pipes are bounded, in three ways, because a byte cap on one frame is not
-  a cap on memory: `MAX_MESSAGE_BYTES` per frame, a total byte budget per
-  request, and a rule that a frame over `LARGE_FRAME_BYTES` addressed to another
-  request is dropped unparsed (parsing 4 MB of JSON costs far more than 4 MB).
-  `STDERR_MAX_LINE_BYTES` does the same job on the other pipe.
+  the caller blocks on data it already has. What those raw bytes mean is
+  `framing`'s job: this module hands each read to a `StdoutFrameReader` and takes
+  parsed messages back.
+- Both pipes are bounded. stdout's three bounds live in `framing` (a per-frame
+  cap, a per-request parse budget, and dropping a large frame that answers
+  another request); `STDERR_MAX_LINE_BYTES` does the same job on the other pipe.
 - The request write is non-blocking and deadline-driven. A server that stops
   reading its stdin used to wedge this process forever once the pipe buffer
   filled, which a 300 KB `--file` reaches on the first write.
@@ -36,7 +36,6 @@ Design notes worth knowing before editing:
 import json
 import logging
 import os
-import re
 import select
 import subprocess
 import threading
@@ -49,6 +48,11 @@ from roblox_studio_cli.errors import (
     StudioMcpProtocolError,
     StudioMcpTimeoutError,
     StudioNotConnectedError,
+)
+from roblox_studio_cli.framing import (
+    MAX_REQUEST_TOTAL_BYTES,
+    MAX_TOOLS_LIST_TOTAL_BYTES,
+    StdoutFrameReader,
 )
 from roblox_studio_cli.mcp_payloads import (
     ToolCallResult,
@@ -74,23 +78,6 @@ DEFAULT_CALL_TOOL_TIMEOUT_SECONDS = 120.0
 
 STDOUT_POLL_INTERVAL_SECONDS = 0.2
 STDOUT_READ_CHUNK_BYTES = 65536
-# One JSON-RPC line cannot legitimately be this big; a screen capture, the
-# largest thing Studio sends, is a few hundred KB of base64. The old 64 MB cap
-# bounded one frame and not this process: ten 4 MB frames parsed into roughly a
-# gigabyte of Python objects, because JSON parsing multiplies size by 20 or more.
-MAX_MESSAGE_BYTES = 8 * 2**20
-# Total bytes parsed while answering one request, which is the cap the per-frame
-# limit above is not. tools/list gets its own, smaller budget across all pages.
-MAX_REQUEST_TOTAL_BYTES = 16 * 2**20
-MAX_TOOLS_LIST_TOTAL_BYTES = 4 * 2**20
-# Over this, a frame is worth identifying before parsing it: if it answers a
-# different request id, dropping it costs a regex over both ends of the line
-# instead of a full parse.
-LARGE_FRAME_BYTES = 64 * 1024
-FRAME_ID_PEEK_BYTES = 4096
-# Bounded digits: an id long enough to trip Python's integer conversion limit
-# must not match, so such a frame falls through to the ordinary parse path.
-FRAME_ID_PATTERN = re.compile(rb'"id"\s*:\s*([0-9]{1,18})(?![0-9])')
 STDERR_MAX_LINE_BYTES = 64 * 1024
 # A write that cannot make progress in this long is a proxy that stopped reading.
 DEFAULT_WRITE_TIMEOUT_SECONDS = 15.0
@@ -145,12 +132,7 @@ class StudioMcpClient:
         self.process: subprocess.Popen | None = None
         self.stdout_fd: int | None = None
         self.stdin_fd: int | None = None
-        self.stdout_buffer = bytearray()
-        self.stdout_scan_position = 0
-        self.pending_messages: deque[dict] = deque()
-        self.request_bytes_consumed = 0
-        self.request_byte_budget = MAX_REQUEST_TOTAL_BYTES
-        self.skipped_large_frames = 0
+        self.frames = StdoutFrameReader()
         self.stderr_lines: deque[str] = deque(maxlen=STDERR_RING_BUFFER_LINES)
         self.stderr_lock = threading.Lock()
         self.stderr_thread: threading.Thread | None = None
@@ -265,7 +247,7 @@ class StudioMcpClient:
                 )
             tools.extend(build_tool_definitions(entries))
 
-            byte_budget -= self.request_bytes_consumed
+            byte_budget -= self.frames.bytes_consumed
             cursor = result.get("nextCursor")
             if not cursor or not isinstance(cursor, str):
                 return tools
@@ -320,8 +302,7 @@ class StudioMcpClient:
         """
         self.request_counter += 1
         request_id = self.request_counter
-        self.request_bytes_consumed = 0
-        self.request_byte_budget = byte_budget
+        self.frames.begin_request(byte_budget)
         deadline = time.monotonic() + timeout
         self.send_message(
             {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params},
@@ -408,14 +389,15 @@ class StudioMcpClient:
     def read_message(self, deadline: float, awaited_id: int | None = None) -> dict | None:
         """Pop the next parsed JSON-RPC message, or `None` once `deadline` passes.
 
-        Reads the raw stdout fd and does its own line buffering so a chunk that
-        carries two messages does not leave the second one stranded in a
-        buffered reader where `select` cannot see it. `awaited_id` lets an
-        oversized frame belonging to some other request be dropped unparsed.
+        Reads the raw stdout fd and hands every chunk to the frame reader, which
+        does the line buffering so a chunk carrying two messages does not leave
+        the second one stranded where `select` cannot see it. `awaited_id` lets
+        an oversized frame belonging to some other request be dropped unparsed.
         """
         while True:
-            if self.pending_messages:
-                return self.pending_messages.popleft()
+            message = self.frames.next_message()
+            if message is not None:
+                return message
 
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -437,119 +419,23 @@ class StudioMcpClient:
                 raise StudioMcpError(
                     f"the Studio MCP proxy closed its output.{self.stderr_suffix()}"
                 )
-            self.stdout_buffer += chunk
-            self.consume_buffered_lines(awaited_id)
+            self.frames.feed(chunk, awaited_id)
             self.enforce_message_size_limit()
 
-    def consume_buffered_lines(self, awaited_id: int | None = None) -> None:
-        """Split whole lines off the stdout buffer and queue the ones that parse as JSON.
-
-        Scanning restarts where the previous scan stopped, so a chunk costs a
-        search of its own bytes rather than of everything buffered so far. A
-        large frame addressed elsewhere is dropped before it is parsed, and only
-        what is parsed is charged against the request's byte budget.
-        """
-        while True:
-            newline_index = self.stdout_buffer.find(b"\n", self.stdout_scan_position)
-            if newline_index < 0:
-                self.stdout_scan_position = len(self.stdout_buffer)
-                return
-            line = bytes(self.stdout_buffer[:newline_index]).strip()
-            del self.stdout_buffer[: newline_index + 1]
-            self.stdout_scan_position = 0
-            if not line:
-                continue
-            if self.frame_answers_another_request(line, awaited_id):
-                self.skipped_large_frames += 1
-                logger.debug("dropped a %d byte frame addressed to another request", len(line))
-                continue
-            self.charge_request_bytes(len(line))
-            message = self.parse_frame(line)
-            if message is not None:
-                self.pending_messages.append(message)
-
-    def parse_frame(self, line: bytes) -> dict | None:
-        """Parse one stdout line into a JSON-RPC message, or None when it is noise.
-
-        Decoding is explicit and lossy on purpose. Handing raw bytes to
-        `json.loads` let invalid UTF-8 surface as `UnicodeDecodeError`, which is
-        a `ValueError` and not a `JSONDecodeError`, so it escaped this method and
-        came out as a traceback. Two more hostile frames did the same: JSON
-        nested thousands deep (`RecursionError`) and an integer long enough to
-        trip Python's string-to-int limit (`ValueError`).
-
-        Raises:
-            StudioMcpProtocolError: the frame is JSON-shaped but unreadable.
-        """
-        text = line.decode("utf-8", errors="replace")
-        try:
-            message = json.loads(text)
-        except json.JSONDecodeError:
-            # The proxy occasionally prints non-protocol noise on stdout; it is
-            # not fatal, so log it and keep reading for real messages.
-            logger.debug("skipping non-JSON stdout line: %r", text[:200])
-            return None
-        except (ValueError, RecursionError) as frame_error:
-            raise StudioMcpProtocolError(
-                code=-1,
-                message=(
-                    f"the proxy sent a {len(line)} byte frame this build cannot read "
-                    f"({type(frame_error).__name__})"
-                ),
-            ) from frame_error
-        if not isinstance(message, dict):
-            logger.debug("skipping non-object JSON-RPC frame: %r", text[:200])
-            return None
-        return message
-
-    def frame_answers_another_request(self, line: bytes, awaited_id: int | None) -> bool:
-        """True when a large frame positively carries a request id we are not waiting for.
-
-        Only large frames are worth the check, and only a positive identification
-        counts: both ends of the line are searched (servers put `id` at either),
-        and a frame with no readable id is parsed as usual rather than guessed at.
-        """
-        if awaited_id is None or len(line) <= LARGE_FRAME_BYTES:
-            return False
-        for window in (line[:FRAME_ID_PEEK_BYTES], line[-FRAME_ID_PEEK_BYTES:]):
-            found = FRAME_ID_PATTERN.search(window)
-            if found is not None:
-                return int(found.group(1)) != awaited_id
-        return False
-
-    def charge_request_bytes(self, consumed: int) -> None:
-        """Count bytes parsed for the current request, and stop when the budget is gone.
-
-        The per-frame cap does not bound memory: parsing JSON multiplies size
-        many times over, so a server can stay under it and still walk this
-        process into a gigabyte with a handful of frames.
-        """
-        self.request_bytes_consumed += consumed
-        if self.request_bytes_consumed <= self.request_byte_budget:
-            return
-        raise StudioMcpError(
-            f"the Studio MCP proxy sent {self.request_bytes_consumed} bytes answering one "
-            f"request (budget {self.request_byte_budget}); refusing to parse more."
-        )
-
     def enforce_message_size_limit(self) -> None:
-        """Kill the proxy rather than buffer an unbounded line.
+        """Kill the proxy rather than let the frame reader buffer an unbounded line.
 
-        The buffer holds only the tail after the last newline, so this trips on
-        one absurd message, never on a busy session.
+        The limit itself lives in `framing`; killing the child is process
+        business, which is why the two halves sit on opposite sides of that line.
         """
-        buffered = len(self.stdout_buffer)
-        if buffered <= MAX_MESSAGE_BYTES:
+        if not self.frames.holds_an_oversized_line():
             return
         try:
             self.process.kill()
             self.process.wait(timeout=KILL_GRACE_SECONDS)
         except (OSError, subprocess.TimeoutExpired) as kill_error:
             logger.warning("could not kill the Studio MCP proxy: %s", kill_error)
-        raise StudioMcpError(
-            f"the Studio MCP proxy sent {buffered} bytes with no line break "
-            f"(limit {MAX_MESSAGE_BYTES}); killed it rather than buffer more."
-        )
+        raise StudioMcpError(self.frames.oversized_line_message())
 
     def drain_stderr(self) -> None:
         """Thread body: copy the proxy's stderr into a ring buffer, line by line.
@@ -650,6 +536,4 @@ class StudioMcpClient:
 
         self.stdout_fd = None
         self.stdin_fd = None
-        self.stdout_buffer = bytearray()
-        self.stdout_scan_position = 0
-        self.pending_messages.clear()
+        self.frames.reset()
