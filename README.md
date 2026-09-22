@@ -161,7 +161,7 @@ The niche: an agent that already has a Studio open wants shell-shaped calls with
 .venv/bin/ruff check
 ```
 
-The suite runs with no Roblox installed. `tests/fake_studio_mcp_server.py` speaks the same protocol and simulates three things: what Studio does (one instance open, none, two, the toggle left off, a late attach, a capture that never answers), what the pipe does (interleaved notifications, a response split mid-JSON, a stderr flood, malformed frames), and what a hostile server does (undecodable bytes, names carrying escapes and newlines, a flood of large frames addressed to nobody, a page larger than the byte budget, a proxy that stops reading its stdin). `AGENTS.md` has the module map.
+The suite runs with no Roblox installed. `tests/fake_studio_mcp_server.py` speaks the same protocol and simulates three things: what Studio does (one instance open, none, two, the toggle left off, a late attach, a capture that never answers, a capture that fails with an image attached), what the pipe does (interleaved notifications, a response split mid-JSON, a stderr flood, malformed frames), and what a hostile server does (undecodable bytes, names carrying escapes and newlines, a server that names itself in 100 KB of clean text, a flood of large frames addressed to nobody, an answer quoting somebody else's id before its own, a page larger than the byte budget, a proxy that stops reading its stdin). `AGENTS.md` has the module map.
 
 ## License
 
