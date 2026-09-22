@@ -324,3 +324,14 @@ def test_missing_binary_is_reported_by_doctor(tmp_path):
     output = all_output(result)
     assert "MISSING" in output
     assert "ROBLOX_STUDIO_MCP_BIN" in output
+
+
+def test_a_hostile_tool_name_cannot_forge_a_row_or_a_verdict():
+    """Every printable field of a tool is server-controlled, and rows are fixed-width."""
+    result = invoke(["tools"], mode="hostile-names")
+    assert result.exit_code == EXIT_OK, all_output(result)
+    lines = all_output(result).splitlines()
+    assert any(line.startswith("sneaky tool_name") for line in lines), lines
+    assert not any(line.startswith("CONNECTED") for line in lines), "a forged verdict line printed"
+    assert "\x1b" not in all_output(result), "an escape sequence reached the terminal"
+    assert any("args: argument name" in line for line in lines), lines

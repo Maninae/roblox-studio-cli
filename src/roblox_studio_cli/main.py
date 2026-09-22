@@ -64,7 +64,7 @@ from roblox_studio_cli.errors import (
 )
 from roblox_studio_cli.image_output import save_images
 from roblox_studio_cli.mcp_payloads import ToolCallResult, ToolDefinition
-from roblox_studio_cli.terminal import echo_server_text
+from roblox_studio_cli.terminal import echo_server_text, sanitize_single_line
 
 EXIT_OK = 0
 EXIT_NOT_READY = 1
@@ -282,13 +282,20 @@ def tools(
         return
 
     for tool in definitions:
-        echo_server_text(f"{tool.name:<{TOOL_NAME_COLUMN_WIDTH}} {tool.description_preview()}")
+        # Every field here is server-controlled and printed as a fixed-width row,
+        # so fold each one onto a single line BEFORE padding it: a newline inside
+        # a tool name would otherwise break the column and forge an extra row.
+        name = sanitize_single_line(tool.name)
+        echo_server_text(f"{name:<{TOOL_NAME_COLUMN_WIDTH}} "
+                         f"{sanitize_single_line(tool.description_preview())}")
         if tool.argument_names:
             required = set(tool.required_argument_names)
             rendered = ", ".join(
                 f"{name}*" if name in required else name for name in tool.argument_names
             )
-            echo_server_text(f"{'':<{TOOL_NAME_COLUMN_WIDTH}} args: {rendered}")
+            echo_server_text(
+                f"{'':<{TOOL_NAME_COLUMN_WIDTH}} args: {sanitize_single_line(rendered)}"
+            )
     typer.echo(f"\n{len(definitions)} tools (* = required)")
 
 

@@ -8,16 +8,22 @@ writing this module: OSC 52 wrote the system clipboard, OSC 0 rewrote the window
 title, and CSI 2J cleared the screen and scrollback.
 
 `sanitize_terminal_text` keeps printable text plus newline and tab, which is
-everything a CLI needs to show, and drops the rest. Two passes, in order:
+everything a CLI needs to show, and drops the rest. Three passes, in order:
 
 1. Every ESC-introduced sequence: CSI (`ESC [ ... final`), OSC (`ESC ] ...`
    terminated by BEL or ST, or unterminated to the end of the text), and the
    single-character escapes.
 2. Every remaining C0 and C1 control character, DEL included. Carriage return
    goes too, since redrawing a line is how output hides itself.
+3. Invisible and reordering Unicode: zero-width characters, the bidi overrides
+   and isolates, the BOM, and the tag block. None of these are executed by a
+   terminal, but all of them change what a reader sees without changing the
+   characters they can select: RLO reverses a rendered filename, a zero-width
+   joiner hides a word boundary, and a tag-character run is invisible payload.
 
 `--json` output does not go through this: `json.dumps` already escapes control
-characters as `\uXXXX`, and a consumer parsing JSON is not a terminal.
+characters as `\uXXXX`, a consumer parsing JSON is not a terminal, and a caller
+piping JSON somewhere else needs the bytes the server actually sent.
 """
 
 import re
@@ -33,19 +39,41 @@ ESCAPE_SEQUENCE_PATTERN = re.compile(
     "|\x1b."
 )
 CONTROL_CHARACTER_PATTERN = re.compile("[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+# Zero-width and bidi marks (200b-200f), bidi embeddings and overrides
+# (202a-202e), the invisible-operator block (2060-2064), the bidi isolates
+# (2066-2069), the byte order mark, and the tag block used to smuggle text that
+# renders as nothing at all.
+INVISIBLE_CHARACTER_PATTERN = re.compile(
+    "[​-‏‪-‮⁠-⁤⁦-⁩﻿\U000e0000-\U000e007f]"
+)
+# What a row-shaped or one-line-shaped print turns a newline or tab into.
+LINE_BREAK_REPLACEMENT = " "
+LINE_BREAK_PATTERN = re.compile("[\n\t]+")
 
 
 def sanitize_terminal_text(text: str) -> str:
-    """Return `text` with every terminal control sequence and control character removed.
+    """Return `text` with every control sequence, control character and invisible mark removed.
 
     Newline and tab survive; everything else that a terminal would interpret
-    rather than print does not. Safe to call on text that is already clean, and
-    on a non-string it stringifies first so an error path cannot trip on it.
+    rather than print, and everything that renders as nothing or reorders what
+    is around it, does not. Safe to call on text that is already clean, and on a
+    non-string it stringifies first so an error path cannot trip on it.
     """
     if not isinstance(text, str):
         text = str(text)
     without_sequences = ESCAPE_SEQUENCE_PATTERN.sub("", text)
-    return CONTROL_CHARACTER_PATTERN.sub("", without_sequences)
+    without_controls = CONTROL_CHARACTER_PATTERN.sub("", without_sequences)
+    return INVISIBLE_CHARACTER_PATTERN.sub("", without_controls)
+
+
+def sanitize_single_line(text: str) -> str:
+    """Sanitised text with newlines and tabs folded into spaces.
+
+    For anything printed as part of a row or an identifier, where a server that
+    puts a newline in a tool name or a place name would otherwise break the
+    column alignment and forge what looks like a second entry.
+    """
+    return LINE_BREAK_PATTERN.sub(LINE_BREAK_REPLACEMENT, sanitize_terminal_text(text)).strip()
 
 
 def echo_server_text(text: str, err: bool = False) -> None:

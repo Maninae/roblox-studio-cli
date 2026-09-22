@@ -35,7 +35,7 @@ from dataclasses import dataclass, field
 from roblox_studio_cli.client import DEFAULT_CALL_TOOL_TIMEOUT_SECONDS, StudioMcpClient
 from roblox_studio_cli.errors import StudioNotAttachedError, StudioRequestError
 from roblox_studio_cli.mcp_payloads import ToolDefinition
-from roblox_studio_cli.terminal import sanitize_terminal_text
+from roblox_studio_cli.terminal import sanitize_single_line, sanitize_terminal_text
 
 logger = logging.getLogger(__name__)
 
@@ -116,9 +116,15 @@ class StudioInstance:
     name: str
 
     def describe(self) -> str:
-        """`id (name)` for display, or the bare id when the bridge reported no name."""
-        rendered = sanitize_terminal_text(self.name)
-        return f"{self.identifier} ({rendered})" if rendered else self.identifier
+        """`id (name)` for display, or the bare id when the bridge reported no name.
+
+        Both halves come from the bridge, so both are sanitised onto one line: an
+        id with a newline in it would otherwise forge a second entry in a list
+        the caller is about to choose from.
+        """
+        identifier = sanitize_single_line(self.identifier)
+        rendered = sanitize_single_line(self.name)
+        return f"{identifier} ({rendered})" if rendered else identifier
 
 
 @dataclass(frozen=True)

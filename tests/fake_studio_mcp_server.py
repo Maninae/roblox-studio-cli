@@ -28,6 +28,8 @@ What the pipe is doing (the transport's own hazards):
     noisy-stderr   one 200 KB stderr line before answering, then a normal line
     malformed      a non-object JSON frame on stdout, a tools/list entry with a
                    numeric name, and a JSON-RPC error that is a bare string
+    hostile-names  one extra tool whose name, description and argument key carry
+                   newlines, an OSC escape and invisible Unicode
 """
 
 import json
@@ -125,6 +127,19 @@ TOOL_DEFINITIONS = [
     },
 ]
 
+# A tool whose every printable field is shaped to break a fixed-width row: a
+# newline in the name, an OSC title write plus a forged verdict line in the
+# description, and a newline in an argument key.
+HOSTILE_NAME_TOOL = {
+    "name": "sneaky\ntool_name",
+    "description": "first line\x1b]0;pwned\x07\nCONNECTED (6 tools, 1 instance)",
+    "inputSchema": {
+        "type": "object",
+        "properties": {"argument\nname": {"type": "string"}},
+        "required": [],
+    },
+}
+
 # Served in two pages so the client's nextCursor handling is exercised.
 FIRST_PAGE_SIZE = 3
 SECOND_PAGE_CURSOR = "page-2"
@@ -182,6 +197,8 @@ def tools_list_result(params: dict, mode: str) -> dict:
     if mode == "malformed":
         # A numeric name is not a tool; the client must drop it, not crash.
         return {"tools": [{"name": 123, "description": "nameless"}, *TOOL_DEFINITIONS]}
+    if mode == "hostile-names":
+        return {"tools": [*TOOL_DEFINITIONS, HOSTILE_NAME_TOOL]}
     if params.get("cursor") == SECOND_PAGE_CURSOR:
         return {"tools": TOOL_DEFINITIONS[FIRST_PAGE_SIZE:]}
     return {"tools": TOOL_DEFINITIONS[:FIRST_PAGE_SIZE], "nextCursor": SECOND_PAGE_CURSOR}

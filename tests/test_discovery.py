@@ -238,3 +238,10 @@ def test_an_unknown_studio_is_rejected_with_the_known_list():
     instances = [StudioInstance("studio-1", "Baseplate")]
     with pytest.raises(ToolDiscoveryError, match="Registered: studio-1"):
         match_requested_instance(instances, "nope")
+
+
+def test_instance_ids_are_sanitised_onto_one_line_as_well_as_names():
+    """A newline in an id would forge an extra entry in the list a caller chooses from."""
+    hostile = StudioInstance(identifier="studio-1\nstudio-2 (Fake)", name="Place‮eht")
+    assert hostile.describe() == "studio-1 studio-2 (Fake) (Placeeht)"
+    assert "\n" not in hostile.describe()
