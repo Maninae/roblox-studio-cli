@@ -171,17 +171,22 @@ def emit_result(
     """Print a tool result, save its images, and exit non-zero when the tool failed.
 
     Images are written in both output modes, because `--out` is an explicit
-    request for the file; `--json` only changes what goes to stdout.
+    request for the file; `--json` only changes what goes to stdout. A file
+    whose contents do not match the extension the caller asked for is reported
+    on stderr in both modes, and never renamed.
     """
     written = save_images(result.images, tool_name, out_path, force)
+    for image in written:
+        if image.warning:
+            echo_server_text(image.warning, err=True)
 
     if as_json:
         typer.echo(json.dumps(result.raw, indent=2))
     else:
         if result.text:
             echo_server_text(result.text)
-        for path in written:
-            typer.echo(str(path))
+        for image in written:
+            typer.echo(str(image.path))
         if not result.text and not written:
             typer.echo("(tool returned no content)")
 
