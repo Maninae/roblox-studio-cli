@@ -188,11 +188,33 @@ def parse_tool_call_result(result: dict) -> ToolCallResult:
             logger.debug("ignoring unknown content type %r", item_type)
 
     return ToolCallResult(
-        is_error=bool(result.get("isError", False)),
+        is_error=read_is_error_flag(result),
         text="\n".join(text_parts),
         images=images,
         raw=result,
     )
+
+
+def read_is_error_flag(result: dict) -> bool:
+    """Whether the tool reported its own failure, from a field the spec says is boolean.
+
+    Only a real `True` is honoured as written. Anything else truthy still counts
+    as a failure, because a server that put something in this field is not
+    reporting success and `bool("false")` would otherwise have to decide it, but
+    it is logged: a build that starts sending `"isError": "false"` is a protocol
+    change worth being able to find. Only the TYPE is logged, never the value,
+    since logging's last-resort handler prints to stderr without sanitising.
+    """
+    flag = result.get("isError", False)
+    if isinstance(flag, bool):
+        return flag
+    if flag:
+        logger.warning(
+            "tool result carried a non-boolean isError of type %s; reading it as a failure",
+            type(flag).__name__,
+        )
+        return True
+    return False
 
 
 def build_tool_definitions(entries: list) -> list[ToolDefinition]:

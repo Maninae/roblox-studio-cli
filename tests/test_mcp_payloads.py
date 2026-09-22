@@ -6,6 +6,7 @@ payload that does not match its declared type are both refusals, not guesses.
 """
 
 import base64
+import logging
 
 import pytest
 
@@ -95,6 +96,47 @@ def test_parse_tool_call_result_flattens_mixed_content():
 def test_parse_tool_call_result_defaults_to_success():
     assert parse_tool_call_result({}).is_error is False
     assert parse_tool_call_result({"content": "not a list"}).text == ""
+
+
+@pytest.mark.parametrize(
+    "flag, expected, reason",
+    [
+        (True, True, "the spec's own failure value"),
+        (False, False, "the spec's own success value"),
+        (None, False, "absent means the call worked"),
+        ("false", True, "a string is not a boolean, and a reader would call this a failure"),
+        ("true", True, "a server that stringified its flag still reported a failure"),
+        (1, True, "the conventional true"),
+        (0, False, "the conventional false"),
+    ],
+)
+def test_is_error_is_read_as_the_boolean_the_spec_says_it_is(flag, expected, reason):
+    """`bool("false")` is True and `bool(0)` is False, so neither can decide this alone.
+
+    Only a real `True` is honoured as written. Anything else truthy is still a
+    failure, because a server that put something in this field is not reporting
+    success, and calling `"false"` a success would hide the one case that matters.
+    """
+    assert parse_tool_call_result({"isError": flag}).is_error is expected, reason
+
+
+def test_a_non_boolean_is_error_is_logged_as_the_protocol_oddity_it_is(caplog):
+    """The outcome is the same either way; the point is that somebody can find out why.
+
+    A build that starts sending `"isError": "false"` is a Studio-side protocol
+    change, and every call from it would read as a failure with no clue on the
+    wire. The type goes to the log, never the value: a log record printed by the
+    last-resort handler would put server text on a terminal unsanitised.
+    """
+    with caplog.at_level(logging.WARNING, logger="roblox_studio_cli.mcp_payloads"):
+        assert parse_tool_call_result({"isError": "false"}).is_error is True
+    assert "isError" in caplog.text and "str" in caplog.text
+    assert "false" not in caplog.text, "server text reached a log record"
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="roblox_studio_cli.mcp_payloads"):
+        parse_tool_call_result({"isError": True})
+    assert caplog.text == "", "an ordinary boolean warned about nothing"
 
 
 def test_raise_for_rpc_error_reads_both_shapes():
