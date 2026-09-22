@@ -26,6 +26,7 @@ import json
 import logging
 import re
 from collections import deque
+from functools import lru_cache
 
 from roblox_studio_cli.errors import StudioMcpError, StudioMcpProtocolError
 
@@ -49,6 +50,20 @@ FRAME_ID_PEEK_BYTES = 4096
 # must not match, so such a frame falls through to the ordinary parse path.
 FRAME_ID_PATTERN = re.compile(rb'"id"\s*:\s*([0-9]{1,18})(?![0-9])')
 NON_JSON_PREVIEW_CHARS = 200
+# One pattern per in-flight request id, and ids only ever count upward.
+AWAITED_ID_PATTERN_CACHE_SIZE = 32
+
+
+@lru_cache(maxsize=AWAITED_ID_PATTERN_CACHE_SIZE)
+def awaited_id_pattern(awaited_id: int) -> re.Pattern:
+    """Match one specific id the way a JSON-RPC frame writes it, bare or quoted.
+
+    A server echoes a numeric request id as `"id": 7` or as `"id": "7"`, and the
+    peek has to recognise both, because mistaking our own answer for somebody
+    else's costs the caller the entire timeout. The bare form ends on a
+    non-digit, so a wait for 7 is not satisfied by 71.
+    """
+    return re.compile(rb'"id"\s*:\s*(?:%d(?![0-9])|"%d")' % (awaited_id, awaited_id))
 
 
 class StdoutFrameReader:
@@ -147,19 +162,29 @@ class StdoutFrameReader:
         return message
 
     def frame_answers_another_request(self, line: bytes, awaited_id: int | None) -> bool:
-        """True when a large frame positively carries a request id we are not waiting for.
+        """True when a large frame positively answers a request that is not ours.
 
-        Only large frames are worth the check, and only a positive identification
-        counts: both ends of the line are searched (servers put `id` at either),
-        and a frame with no readable id is parsed as usual rather than guessed at.
+        Only large frames are worth the check, and both ends of the line are
+        searched, because servers put `id` at either. The AWAITED id is looked for
+        first, and wins wherever it turns up: a large legitimate answer routinely
+        quotes some other numeric id inside its payload (a place id, an asset id,
+        an instance record) thousands of bytes before its own `id` member in the
+        tail. Taking the first id seen as the frame's own dropped exactly those
+        answers, and since nothing else was coming, the call then burned the
+        whole timeout.
+
+        So a frame is dropped only when some other id is positively identified
+        AND the awaited id appears in neither window. Everything else, including
+        a frame with no readable id at all, falls through to an ordinary parse:
+        the cost of parsing a frame we did not need is one wasted parse, and the
+        cost of dropping one we did need is the caller's entire deadline.
         """
         if awaited_id is None or len(line) <= LARGE_FRAME_BYTES:
             return False
-        for window in (line[:FRAME_ID_PEEK_BYTES], line[-FRAME_ID_PEEK_BYTES:]):
-            found = FRAME_ID_PATTERN.search(window)
-            if found is not None:
-                return int(found.group(1)) != awaited_id
-        return False
+        windows = (line[:FRAME_ID_PEEK_BYTES], line[-FRAME_ID_PEEK_BYTES:])
+        if any(awaited_id_pattern(awaited_id).search(window) for window in windows):
+            return False
+        return any(FRAME_ID_PATTERN.search(window) for window in windows)
 
     def charge_request_bytes(self, consumed: int) -> None:
         """Count bytes parsed for the current request, and stop when the budget is gone.

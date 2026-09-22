@@ -45,6 +45,22 @@ def large_frame(frame: dict) -> bytes:
     return json.dumps(padded).encode("utf-8") + b"\n"
 
 
+def frame_quoting_another_id_first(own_id) -> bytes:
+    """A large answer that mentions someone else's id in its payload, then carries its own.
+
+    The shape every bulk Studio answer has: records with their own numeric `id`
+    fields at the head (place ids, asset ids, instance records), the payload in
+    the middle, and the JSON-RPC `id` last, because that is where a server that
+    streams its result writes it.
+    """
+    body = {
+        "jsonrpc": "2.0",
+        "result": {"records": [{"id": OTHER_ID}], "padding": "x" * PADDING_BYTES},
+        "id": own_id,
+    }
+    return json.dumps(body).encode("utf-8") + b"\n"
+
+
 def test_two_frames_in_one_chunk_both_arrive():
     """A single read carrying two messages must not strand the second one."""
     reader = StdoutFrameReader()
@@ -157,3 +173,31 @@ def test_nothing_is_dropped_when_no_request_is_in_flight():
     reader = StdoutFrameReader()
     reader.feed(large_frame({"jsonrpc": "2.0", "id": OTHER_ID}), awaited_id=None)
     assert len(drain(reader)) == 1
+
+
+def test_a_large_answer_quoting_another_id_in_its_payload_is_still_ours():
+    """The decoy case: `"id": 999999` in the first window, our own id in the last.
+
+    Dropping this frame cost the caller the entire timeout (measured at 6.09 s
+    against a 64 KB+ answer), because nothing else was ever going to arrive.
+    """
+    reader = StdoutFrameReader()
+    reader.feed(frame_quoting_another_id_first(AWAITED_ID), awaited_id=AWAITED_ID)
+    assert [message["id"] for message in drain(reader)] == [AWAITED_ID]
+    assert reader.skipped_large_frames == 0, "a frame carrying the awaited id was dropped"
+
+
+def test_a_quoted_string_id_counts_as_the_awaited_id():
+    """Some servers echo a numeric request id as a string; that is still our answer."""
+    reader = StdoutFrameReader()
+    reader.feed(frame_quoting_another_id_first(str(AWAITED_ID)), awaited_id=AWAITED_ID)
+    assert [message["id"] for message in drain(reader)] == [str(AWAITED_ID)]
+    assert reader.skipped_large_frames == 0
+
+
+def test_a_neighbouring_id_does_not_pass_for_the_awaited_one():
+    """`"id": 71` must not satisfy a wait for id 7, in either direction."""
+    reader = StdoutFrameReader()
+    reader.feed(frame_quoting_another_id_first(AWAITED_ID * 10 + 1), awaited_id=AWAITED_ID)
+    assert drain(reader) == []
+    assert reader.skipped_large_frames == 1

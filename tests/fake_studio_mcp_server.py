@@ -33,6 +33,8 @@ What the pipe is doing (the transport's own hazards):
     invalid-utf8   a stdout line that is not decodable UTF-8, then a normal answer
     stray-flood    several 200 KB frames carrying a request id nobody awaits,
                    ahead of the first page of the real answer
+    decoy-id       a large, legitimate answer that quotes somebody else's id in
+                   its payload before carrying its own in the tail
     huge-list      a tools/list answer larger than the whole-list byte budget
     deaf-stdin     answers the handshake, then never reads its stdin again, so a
                    large request fills the pipe buffer and a blocking write hangs
@@ -71,6 +73,10 @@ UNDECODABLE_STDOUT_LINE = b'{"jsonrpc": "2.0", "note": "\x80\xfe\x81"}\n'
 STRAY_FRAME_COUNT = 6
 STRAY_FRAME_PAYLOAD_BYTES = 200_000
 STRAY_FRAME_REQUEST_ID = 999_999
+# Big enough to cross the client's 64 KB peek threshold, small enough to keep the
+# suite quick. The decoy id sits in the head window, the real one in the tail.
+DECOY_FRAME_PAYLOAD_BYTES = 80_000
+DECOY_RECORD_ID = 999_999
 # Over the client's 4 MB whole-list budget, under its 8 MB per-frame cap.
 HUGE_DESCRIPTION_BYTES = 5 * 2**20
 DEAF_SLEEP_SECONDS = 30
@@ -254,6 +260,9 @@ def handle_tools_call(request_id: int, params: dict, mode: str) -> dict | None:
     name = params.get("name")
     arguments = params.get("arguments", {})
 
+    if mode == "decoy-id" and name == "execute_luau":
+        return decoy_id_answer(request_id)
+
     if mode == "capture-silent" and name == "screen_capture":
         # Studio with the display asleep: the call is accepted and no result
         # ever arrives, so the client's own timeout is the only thing that ends it.
@@ -316,6 +325,23 @@ def flood_stdout_with_stray_frames() -> None:
         }
         sys.stdout.write(json.dumps(stray) + "\n")
     sys.stdout.flush()
+
+
+def decoy_id_answer(request_id: int) -> dict:
+    """A large, ordinary answer that mentions another id long before its own.
+
+    The shape a bulk Studio answer really has: records carrying their own numeric
+    `id` fields (place ids, asset ids, instance records) at the head, the payload
+    in the middle, and the JSON-RPC `id` last, which is where `json.dumps` writes
+    the last key it was given. A client that takes the first id it sees as the
+    frame's own drops this answer and then waits out its whole timeout.
+    """
+    result = {
+        "records": [{"id": DECOY_RECORD_ID, "name": "Baseplate"}],
+        "content": [{"type": "text", "text": "luau ok: " + "x" * DECOY_FRAME_PAYLOAD_BYTES}],
+        "isError": False,
+    }
+    return {"jsonrpc": "2.0", "result": result, "id": request_id}
 
 
 def flood_stderr() -> None:

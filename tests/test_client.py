@@ -41,6 +41,7 @@ SILENT_SERVER_TIMEOUT_SECONDS = 2.0
 DEAF_SERVER_TIMEOUT_SECONDS = 2.0
 STUDIO_ID = "studio-1"
 STRAY_FRAME_COUNT = 6
+DECOY_ANSWER_TIMEOUT_SECONDS = 3.0
 
 # Answers the handshake, then swallows everything else without logging a thing:
 # silence that is NOT the Studio toggle, and must not be reported as the toggle.
@@ -273,6 +274,24 @@ def test_a_small_frame_for_another_request_is_still_parsed_and_skipped_normally(
     client = fake_client("chatty")
     assert client.list_tools()
     assert client.frames.skipped_large_frames == 0
+
+
+def test_a_large_answer_that_quotes_another_id_still_reaches_the_caller(fake_client):
+    """The frame is ours; the other id is in its payload. Dropping it burned the timeout.
+
+    Measured before the fix: this call took 6.09 s and ended in a timeout, because
+    the peek read the record id in the head window as the frame's own.
+    """
+    client = fake_client("decoy-id")
+    started = time.monotonic()
+    result = client.call_tool(
+        "execute_luau",
+        {"code": "return 1", "datamodel_type": "Edit", "studio_id": STUDIO_ID},
+        timeout=DECOY_ANSWER_TIMEOUT_SECONDS,
+    )
+    assert "luau ok:" in result.text
+    assert client.frames.skipped_large_frames == 0, "our own answer was dropped"
+    assert time.monotonic() - started < DECOY_ANSWER_TIMEOUT_SECONDS, "the answer was waited out"
 
 
 def test_one_request_cannot_parse_more_than_its_byte_budget(fake_client):
