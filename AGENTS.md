@@ -25,8 +25,9 @@ Sizes are a budget, not a suggestion: `wc -l src/roblox_studio_cli/*.py` should 
 
 Matching is strict on purpose, because the failure it prevents is calling the wrong tool on a live place:
 - Whole tokens, never substrings. `evaluate_expression` contains "lua"; it must not answer a Luau request.
-- Keywords name the action as well as the subject: `list_studios`, not `studios`; `get_state`, not `state`. A `close_studios` or a `reset_state` must never win a read.
-- Outside an exact name hit, a candidate must declare one of the intent's expected arguments and must be the only candidate. Two plausible tools is an error naming both.
+- Keywords name the action as well as the subject: `list_studios`, not `studios`; `get_state`, not `state`. Never a bare subject (`luau`, `capture`, `play`): with those on the list, `execute_luau_and_delete_place` and `delete_capture` won the lookup.
+- Outside an exact name hit, the candidate's token set must EQUAL the keyword's. A superset is a different tool. The candidate must also declare one of the intent's expected arguments and must be the only candidate. Two plausible tools is an error naming both.
+- A destructive verb in a name (`delete`, `remove`, `close`, `reset`, `clear`, `stop`, `destroy`, `wipe`) disqualifies the tool from every convenience command, at both tiers. An intent that legitimately destroys something declares that verb in `allowed_destructive_tokens`; play control is the only one, for `start_stop_play`.
 
 **Sanitise everything the bridge said.** Tool output, tool names and descriptions, instance and place names, the proxy's stderr: all of it can carry terminal escape sequences. It reaches a terminal only through `terminal.echo_server_text` or after `sanitize_terminal_text`, never a bare `typer.echo`. `--json` is exempt: `json.dumps` escapes control characters already.
 

@@ -6,18 +6,25 @@ the `tools/list` payload Studio returned this run, so a Roblox rename
 matching tool" message instead of a silent wrong call.
 
 Matching is deliberately strict, because the failure it prevents is calling the
-wrong tool on someone's open place. Three rules:
+wrong tool on someone's open place. Four rules:
 
 - Names match on whole tokens, never on substrings. `execute_luau` splits into
   {execute, luau} and `screenCapture` into {screen, capture}. Substring matching
   used to pick `evaluate_expression` for "lua" (it is in "eva-lua-te") and
   `close_studios` for "studios".
 - A keyword names the ACTION as well as the subject: "list_studios", not
-  "studios"; "get_state", not "state". A tool has to carry every token of the
-  keyword, so a `reset_state` or a `close_studios` cannot answer a read.
-- Outside an exact name hit, a candidate must also declare one of the arguments
-  the intent needs, and must be the only candidate. Anything else is an error
-  naming the alternatives, so the caller can fall back to `roblox-studio call`.
+  "studios"; "get_state", not "state". There are no bare subject keywords, which
+  is what a pen-test round turned up: with "luau" on the list, a server offering
+  `execute_luau_and_delete_place` or `delete_lua_scripts` won the lookup.
+- Outside an exact name hit, the candidate's token set must EQUAL the keyword's,
+  not merely contain it. A superset is a different tool: `delete_capture` is not
+  a capture. The candidate must also declare one of the arguments the intent
+  needs, and must be the only candidate. Anything else is an error naming the
+  alternatives, so the caller can fall back to `roblox-studio call`.
+- A destructive verb in a name disqualifies it from every convenience command,
+  at both tiers, however well it matches. An intent that legitimately destroys
+  something says so once, in `allowed_destructive_tokens`: `start_stop_play`
+  carries "stop" and the play intent is the only one that accepts it.
 
 Studio instance resolution lives here too. Every Studio tool except the instance
 lister takes a required `studio_id`, and Studio attaches to a freshly connected
@@ -68,6 +75,13 @@ NO_STUDIO_INSTANCE_MESSAGE = (
 
 TOOL_NAME_TOKEN_PATTERN = re.compile(r"[A-Z]+(?![a-z])|[A-Z][a-z0-9]*|[a-z0-9]+")
 
+# Verbs that make a tool the wrong answer to "show me" or "run this", whatever
+# else its name says. No convenience command may bind to a name carrying one,
+# unless its intent declares that verb (only play control does, for "stop").
+DESTRUCTIVE_NAME_TOKENS = frozenset(
+    {"delete", "remove", "close", "reset", "clear", "stop", "destroy", "wipe"}
+)
+
 
 class ToolDiscoveryError(StudioRequestError):
     """No live tool matches the intent, or the call cannot be made as asked.
@@ -84,15 +98,20 @@ class ToolIntent:
     Attributes:
         purpose: human words for the error message ("Luau execution").
         name_keywords: candidate names, most specific first. Each must carry the
-            action token, so a keyword is "list_studios" rather than "studios".
+            action token, so a keyword is "list_studios" rather than "studios",
+            and never a bare subject like "luau" or "capture".
         expected_arguments: argument names that prove a candidate does this job.
             Enforced for every match except an exact name hit, where the name is
             evidence enough and a future build may have renamed its arguments.
+        allowed_destructive_tokens: the destructive verbs this intent is allowed
+            to bind to. Empty for everything but play control, whose real tool is
+            `start_stop_play`.
     """
 
     purpose: str
     name_keywords: tuple[str, ...]
     expected_arguments: tuple[str, ...] = ()
+    allowed_destructive_tokens: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -147,12 +166,12 @@ LIST_INSTANCES_INTENT = ToolIntent(
 )
 LUAU_INTENT = ToolIntent(
     purpose="Luau execution",
-    name_keywords=("execute_luau", "run_luau", "luau", "lua"),
+    name_keywords=("execute_luau", "run_luau"),
     expected_arguments=LUAU_CODE_ARGUMENT_NAMES,
 )
 SCREENSHOT_INTENT = ToolIntent(
     purpose="screen capture",
-    name_keywords=("screen_capture", "screenshot", "capture"),
+    name_keywords=("screen_capture", "screenshot"),
     expected_arguments=CAPTURE_ID_ARGUMENT_NAMES,
 )
 STUDIO_STATE_INTENT = ToolIntent(
@@ -161,8 +180,9 @@ STUDIO_STATE_INTENT = ToolIntent(
 )
 PLAY_INTENT = ToolIntent(
     purpose="play control",
-    name_keywords=("start_stop_play", "start_stop", "play"),
+    name_keywords=("start_stop_play", "start_stop"),
     expected_arguments=PLAY_START_ARGUMENT_NAMES,
+    allowed_destructive_tokens=("stop",),
 )
 
 
@@ -183,20 +203,52 @@ def declares_any_argument(tool: ToolDefinition, argument_names: tuple[str, ...])
     return any(name in declared for name in argument_names)
 
 
+def destructive_tokens_in(tool_name: str, intent: ToolIntent) -> set[str]:
+    """Destructive verbs in a tool name that this intent has not declared.
+
+    Empty means the name is safe to bind to. `start_stop_play` returns empty for
+    the play intent (which declares "stop") and {"stop"} for every other intent.
+    """
+    return (tool_name_tokens(tool_name) & DESTRUCTIVE_NAME_TOKENS) - set(
+        intent.allowed_destructive_tokens
+    )
+
+
+def plausible_destructive_names(tools: list[ToolDefinition], intent: ToolIntent) -> list[str]:
+    """Destructive tools that carry every token of some keyword, for the error message.
+
+    These are exactly the names that used to win the lookup under the old
+    "candidate contains the keyword's tokens" rule, so naming them tells the
+    caller why a tool that looks right was passed over.
+    """
+    names = []
+    for tool in tools:
+        if not destructive_tokens_in(tool.name, intent):
+            continue
+        tokens = tool_name_tokens(tool.name)
+        if any(tool_name_tokens(keyword) <= tokens for keyword in intent.name_keywords):
+            names.append(tool.name)
+    return names
+
+
 def find_tool(tools: list[ToolDefinition], intent: ToolIntent) -> ToolMatch:
     """Pick the one live tool that serves `intent`.
 
-    Exact name first, in keyword order. Then whole-token matching, where a
-    candidate must also declare one of the intent's arguments and must be the
-    only such candidate: two plausible tools is an error, not a coin toss.
+    Destructive names are dropped first, so no later tier can resurrect one.
+    Then exact name, in keyword order. Then whole-token matching on an EQUAL
+    token set, where a candidate must also declare one of the intent's arguments
+    and must be the only such candidate: two plausible tools is an error, not a
+    coin toss.
 
     Raises:
         ToolDiscoveryError: nothing matched, or several things did. The message
             says which, lists what Studio does expose, and points at
             `roblox-studio call`.
     """
+    safe = [tool for tool in tools if not destructive_tokens_in(tool.name, intent)]
+
     for keyword in intent.name_keywords:
-        for tool in tools:
+        for tool in safe:
             if tool.name.lower() == keyword.lower():
                 return ToolMatch(tool=tool, matched_by_exact_name=True)
 
@@ -204,7 +256,7 @@ def find_tool(tools: list[ToolDefinition], intent: ToolIntent) -> ToolMatch:
     rejected: list[str] = []
     for keyword in intent.name_keywords:
         keyword_tokens = tool_name_tokens(keyword)
-        named = [tool for tool in tools if keyword_tokens <= tool_name_tokens(tool.name)]
+        named = [tool for tool in safe if tool_name_tokens(tool.name) == keyword_tokens]
         usable = [tool for tool in named if declares_any_argument(tool, intent.expected_arguments)]
         rejected.extend(tool.name for tool in named if tool not in usable)
         if len(usable) == 1:
@@ -213,7 +265,8 @@ def find_tool(tools: list[ToolDefinition], intent: ToolIntent) -> ToolMatch:
         if len(usable) > 1:
             ambiguous = [tool.name for tool in usable]
 
-    raise ToolDiscoveryError(no_tool_message(tools, intent, ambiguous, rejected))
+    destructive = plausible_destructive_names(tools, intent)
+    raise ToolDiscoveryError(no_tool_message(tools, intent, ambiguous, rejected, destructive))
 
 
 def no_tool_message(
@@ -221,10 +274,16 @@ def no_tool_message(
     intent: ToolIntent,
     ambiguous: list[str],
     rejected: list[str],
+    destructive: list[str],
 ) -> str:
-    """Explain a failed lookup: too many candidates, wrong-shaped ones, or none at all."""
+    """Explain a failed lookup: too many candidates, destructive or wrong-shaped ones, or none."""
     if ambiguous:
         detail = f"Several tools could be it: {', '.join(sorted(set(ambiguous)))}."
+    elif destructive:
+        detail = (
+            f"{', '.join(sorted(set(destructive)))} matched by name but carries a "
+            "destructive verb, so no convenience command will call it."
+        )
     elif rejected:
         wanted = ", ".join(intent.expected_arguments)
         detail = (

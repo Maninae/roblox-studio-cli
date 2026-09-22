@@ -5,16 +5,20 @@ subprocess nor Roblox. They pin the two behaviours that matter: intent maps onto
 whatever names the live server reports (surviving a Roblox rename), and it
 refuses to map onto a tool that merely looks similar.
 
-The decoy names below are the ones substring matching actually picked wrong:
-`evaluate_expression` contains "lua" inside "eva-lua-te", `reset_state` contains
-"state", `close_studios` contains "studios", `screen_share` contains "screen".
-Calling any of them instead of the tool the user asked for would act on a live
-place, so each gets a test.
+The decoy names below are the ones matching actually picked wrong, in two
+rounds. Substring matching picked `evaluate_expression` for "lua" (it is inside
+"eva-lua-te"), `reset_state` for "state", `close_studios` for "studios" and
+`screen_share` for "screen". A pen-test round then found that whole-token
+matching still accepted any SUPERSET of a keyword's tokens, so a server offering
+`execute_luau_and_delete_place`, `delete_lua_scripts` or `delete_capture` won
+the lookup outright. Calling any of them instead of the tool the user asked for
+would act on a live place, so each gets a test.
 """
 
 import pytest
 
 from roblox_studio_cli.discovery import (
+    DESTRUCTIVE_NAME_TOKENS,
     LIST_INSTANCES_INTENT,
     LUAU_CODE_ARGUMENT_NAMES,
     LUAU_INTENT,
@@ -23,7 +27,9 @@ from roblox_studio_cli.discovery import (
     STUDIO_STATE_INTENT,
     StudioInstance,
     ToolDiscoveryError,
+    ToolIntent,
     check_required_arguments,
+    destructive_tokens_in,
     find_argument_name,
     find_tool,
     match_requested_instance,
@@ -68,12 +74,27 @@ DECOY_RESET_STATE = build_tool("reset_state", {"studio_id": STRING}, ["studio_id
 DECOY_CLOSE_STUDIOS = build_tool("close_studios", {"studio_id": STRING}, ["studio_id"])
 DECOY_SCREEN_SHARE = build_tool("screen_share", {"studio_id": STRING}, ["studio_id"])
 DECOY_CAPTURE_METRICS = build_tool("capture_metrics", {"studio_id": STRING})
+
+# The pen-test round's decoys: a correct token superset, plus the arguments that
+# would satisfy the intent's shape check. Under the old rules each of these won.
+DECOY_LUAU_AND_DELETE = build_tool(
+    "execute_luau_and_delete_place", {"code": STRING, "studio_id": STRING}, ["code"]
+)
+DECOY_DELETE_LUA_SCRIPTS = build_tool(
+    "delete_lua_scripts", {"code": STRING, "studio_id": STRING}, ["code"]
+)
+DECOY_DELETE_CAPTURE = build_tool(
+    "delete_capture", {"capture_id": STRING, "studio_id": STRING}, ["capture_id"]
+)
 ALL_DECOYS = [
     DECOY_EVALUATE,
     DECOY_RESET_STATE,
     DECOY_CLOSE_STUDIOS,
     DECOY_SCREEN_SHARE,
     DECOY_CAPTURE_METRICS,
+    DECOY_LUAU_AND_DELETE,
+    DECOY_DELETE_LUA_SCRIPTS,
+    DECOY_DELETE_CAPTURE,
 ]
 
 
@@ -109,6 +130,9 @@ def test_every_intent_finds_its_tool_among_the_decoys(intent, expected):
         (LIST_INSTANCES_INTENT, DECOY_CLOSE_STUDIOS),
         (SCREENSHOT_INTENT, DECOY_SCREEN_SHARE),
         (SCREENSHOT_INTENT, DECOY_CAPTURE_METRICS),
+        (LUAU_INTENT, DECOY_LUAU_AND_DELETE),
+        (LUAU_INTENT, DECOY_DELETE_LUA_SCRIPTS),
+        (SCREENSHOT_INTENT, DECOY_DELETE_CAPTURE),
     ],
 )
 def test_a_decoy_alone_is_refused_rather_than_called(intent, decoy):
@@ -118,12 +142,42 @@ def test_a_decoy_alone_is_refused_rather_than_called(intent, decoy):
     assert decoy.name in str(raised.value), "the message should name what Studio does expose"
 
 
-def test_find_tool_survives_a_rename():
-    """A renamed Luau tool is still found, through the loose keyword plus its arguments."""
-    renamed = build_tool("run_lua_script", {"source": STRING}, ["source"])
+def test_find_tool_survives_a_restyled_name_and_a_renamed_argument():
+    """Same tokens in a different style or order still match; the argument may be renamed."""
+    renamed = build_tool("luau-execute", {"source": STRING}, ["source"])
     match = find_tool([renamed, DECOY_EVALUATE], LUAU_INTENT)
-    assert match.tool.name == "run_lua_script"
+    assert match.tool.name == "luau-execute"
     assert match.matched_by_exact_name is False, "a loose match must not license argument guessing"
+
+
+def test_a_token_superset_is_a_different_tool_not_a_rename():
+    """`run_lua_script` may be anything; strictness costs a fallback to `call`, not a wrong call."""
+    superset = build_tool("run_lua_script", {"code": STRING}, ["code"])
+    with pytest.raises(ToolDiscoveryError, match="run_lua_script"):
+        find_tool([superset], LUAU_INTENT)
+
+
+def test_a_destructive_verb_disqualifies_a_tool_even_on_an_exact_name_hit():
+    """The deny-list is the last lock: it holds even when a keyword names the tool outright."""
+    hostile = build_tool("close_studios", {"studio_id": STRING}, ["studio_id"])
+    mistaken_intent = ToolIntent(purpose="Studio instance list", name_keywords=("close_studios",))
+    with pytest.raises(ToolDiscoveryError, match="destructive verb"):
+        find_tool([hostile], mistaken_intent)
+
+
+def test_the_deny_list_is_per_intent_so_play_can_still_stop():
+    """"stop" is destructive everywhere except play control, which declares it."""
+    assert destructive_tokens_in("start_stop_play", PLAY_INTENT) == set()
+    assert destructive_tokens_in("start_stop_play", LUAU_INTENT) == {"stop"}
+    assert find_tool([PLAY_TOOL], PLAY_INTENT).tool.name == "start_stop_play"
+
+
+@pytest.mark.parametrize("token", sorted(DESTRUCTIVE_NAME_TOKENS))
+def test_every_destructive_token_disqualifies_a_luau_candidate(token):
+    hostile = build_tool(f"execute_luau_{token}", {"code": STRING}, ["code"])
+    assert destructive_tokens_in(hostile.name, LUAU_INTENT) == {token}
+    with pytest.raises(ToolDiscoveryError):
+        find_tool([hostile], LUAU_INTENT)
 
 
 def test_find_tool_accepts_camel_case_renames():
@@ -132,18 +186,20 @@ def test_find_tool_accepts_camel_case_renames():
 
 
 def test_find_tool_refuses_to_choose_between_two_plausible_tools():
-    """Two candidates is an error naming both, not a coin toss on name length."""
+    """Two tools with the same tokens is an error naming both, not a coin toss."""
     tools = [
-        build_tool("run_lua_fast", {"code": STRING}, ["code"]),
-        build_tool("run_lua_safe", {"code": STRING}, ["code"]),
+        build_tool("luau_run", {"code": STRING}, ["code"]),
+        build_tool("runLuau", {"code": STRING}, ["code"]),
     ]
     with pytest.raises(ToolDiscoveryError, match="Several tools could be it"):
         find_tool(tools, LUAU_INTENT)
 
 
 def test_find_tool_says_when_the_name_matched_but_the_shape_did_not():
+    """Right tokens, wrong shape: no capture id argument, so it is not the capture tool."""
+    lookalike = build_tool("screen-capture", {"studio_id": STRING}, ["studio_id"])
     with pytest.raises(ToolDiscoveryError, match="matched by name but declares none of"):
-        find_tool([DECOY_CAPTURE_METRICS], SCREENSHOT_INTENT)
+        find_tool([lookalike], SCREENSHOT_INTENT)
 
 
 def test_find_tool_lists_alternatives_when_nothing_matches():
