@@ -211,6 +211,17 @@ def test_find_tool_lists_alternatives_when_nothing_matches():
         find_tool([build_tool("insert_asset", {})], LUAU_INTENT)
 
 
+def test_the_list_of_alternatives_stops_before_it_buries_the_advice():
+    """A build exposing hundreds of tools must not push the `call` hint off the screen."""
+    crowd = [build_tool(f"insert_asset_{index:03d}", {}) for index in range(80)]
+    with pytest.raises(ToolDiscoveryError) as raised:
+        find_tool(crowd, LUAU_INTENT)
+    message = str(raised.value)
+    assert "and 60 more" in message
+    assert "roblox-studio call" in message, "the advice was buried by the enumeration"
+    assert len(message) < 1000, message
+
+
 def test_find_argument_prefers_the_known_name():
     assert find_argument_name(LUAU_TOOL, LUAU_CODE_ARGUMENT_NAMES, True) == "code"
 
@@ -231,6 +242,18 @@ def test_check_required_arguments_names_what_is_missing():
     message = str(raised.value)
     assert "datamodel_type" in message and "studio_id" in message
     assert "--args" in message
+
+
+def test_a_crowd_of_missing_arguments_is_named_only_as_far_as_it_is_useful():
+    """The schema decides how many keys are required, and the server writes the schema."""
+    crowd = build_tool("x", {f"arg{index}": STRING for index in range(60)},
+                       [f"arg{index}" for index in range(60)])
+    with pytest.raises(ToolDiscoveryError) as raised:
+        check_required_arguments(crowd, {})
+    message = str(raised.value)
+    assert "and 40 more" in message
+    assert "arg59" not in message
+    assert len(message) < 1000, message
 
 
 def test_check_required_arguments_passes_when_complete():
@@ -298,6 +321,16 @@ def test_an_unknown_studio_is_rejected_with_the_known_list():
     instances = [StudioInstance("studio-1", "Baseplate")]
     with pytest.raises(ToolDiscoveryError, match="Registered: studio-1"):
         match_requested_instance(instances, "nope")
+
+
+def test_the_registered_list_is_capped_in_count_as_well_as_per_row():
+    """Each row was already capped; the number of rows is the bridge's choice too."""
+    crowd = [StudioInstance(f"studio-{index}", f"Place{index}") for index in range(60)]
+    with pytest.raises(ToolDiscoveryError) as raised:
+        match_requested_instance(crowd, "nope")
+    message = str(raised.value)
+    assert "and 40 more" in message
+    assert "studio-59" not in message
 
 
 def test_instance_ids_are_sanitised_onto_one_line_as_well_as_names():

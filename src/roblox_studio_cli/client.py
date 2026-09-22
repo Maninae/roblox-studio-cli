@@ -30,7 +30,8 @@ Design notes worth knowing before editing:
   reading its stdin used to wedge this process forever once the pipe buffer
   filled, which a 300 KB `--file` reaches on the first write.
 - Anything server-controlled that lands in an exception message goes through
-  `sanitize_terminal_text` first, because those messages get printed.
+  `sanitize_diagnostic_line` first, because those messages get printed, and the
+  proxy chooses both what they say and how long they are.
 """
 
 import json
@@ -61,7 +62,7 @@ from roblox_studio_cli.mcp_payloads import (
     parse_tool_call_result,
     raise_for_rpc_error,
 )
-from roblox_studio_cli.terminal import sanitize_terminal_text
+from roblox_studio_cli.terminal import sanitize_diagnostic_line
 
 logger = logging.getLogger(__name__)
 
@@ -474,8 +475,14 @@ class StudioMcpClient:
         return "\n".join(lines[-max_lines:])
 
     def stderr_suffix(self) -> str:
-        """Recent stderr, sanitised, formatted for appending to an exception message."""
-        stderr_text = sanitize_terminal_text(self.recent_stderr())
+        """Recent stderr, sanitised and capped per line, for appending to an exception.
+
+        Each quoted line is diagnostic chrome whose length the proxy chose, and
+        `STDERR_MAX_LINE_BYTES` lets a 64 KB one into the ring buffer, so six of
+        them used to mean 384 KB under a one-line message.
+        """
+        quoted = [sanitize_diagnostic_line(line) for line in self.recent_stderr().splitlines()]
+        stderr_text = "\n".join(line for line in quoted if line)
         return f"\nProxy stderr:\n{stderr_text}" if stderr_text else ""
 
     def not_connected_error(self) -> StudioNotConnectedError:

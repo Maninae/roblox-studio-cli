@@ -378,6 +378,25 @@ def test_doctor_caps_the_fields_whose_length_the_server_chooses():
     assert len(output) < 1500, "the server's own text reached the terminal at its own length"
 
 
+def test_a_crowded_build_cannot_bury_the_advice_under_its_own_tool_list(tmp_path):
+    """46 tools is already too many to print; a build with hundreds is the real case."""
+    result = invoke(["call", "no_such_tool"], mode="crowded")
+    assert result.exit_code == EXIT_REQUEST_ERROR
+    output = all_output(result)
+    assert "and 26 more" in output, output
+    assert "insert_asset_039" not in output
+    assert len(output) < 1000, output
+
+
+def test_a_crowd_of_registered_studios_is_listed_only_as_far_as_it_helps():
+    result = invoke(["luau", "print(1)"], mode="crowded")
+    assert result.exit_code == EXIT_REQUEST_ERROR
+    output = all_output(result)
+    assert "40 Studio instances are registered" in output, "the real count was dropped"
+    assert "and 20 more" in output
+    assert "studio-39" not in output
+
+
 def test_doctor_json_still_carries_the_full_field():
     """--json is for a consumer, not a terminal: it gets the bytes as sent."""
     report = json.loads(invoke(["doctor", "--json"], mode="giant-names").output)

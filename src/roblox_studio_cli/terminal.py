@@ -27,6 +27,7 @@ piping JSON somewhere else needs the bytes the server actually sent.
 """
 
 import re
+from collections.abc import Iterable
 
 import typer
 
@@ -57,6 +58,12 @@ LINE_BREAK_PATTERN = re.compile("[\n\t]+")
 # because that is the thing the caller asked for.
 MAX_DIAGNOSTIC_TEXT_CHARS = 200
 TRUNCATION_MARKER = "..."
+# How many server-chosen names one message may enumerate. Every such list (the
+# tools a build exposes, the arguments a schema demands, the instances that
+# registered) is chrome in front of the advice that follows it, and its length
+# is the bridge's choice: 200 tools at 200 characters each is 40 KB of scroll
+# between the caller and the sentence telling them what to do instead.
+MAX_ENUMERATED_NAMES = 20
 
 
 def sanitize_terminal_text(text: str) -> str:
@@ -104,6 +111,20 @@ def sanitize_diagnostic_line(text: str) -> str:
     answer itself, which is never capped.
     """
     return truncate_display_text(sanitize_single_line(text))
+
+
+def capped_display_names(names: Iterable[str], limit: int = MAX_ENUMERATED_NAMES) -> list[str]:
+    """Sanitised one-line names for an enumeration, ending in "and N more" when cut.
+
+    The list half of the chrome rule: `sanitize_diagnostic_line` bounds how long
+    one name may print, and this bounds how many of them print at all. Callers
+    join the result however their message reads, with a comma or a row each.
+    """
+    entries = list(names)
+    shown = [sanitize_diagnostic_line(name) for name in entries[:limit]]
+    if len(entries) > limit:
+        shown.append(f"and {len(entries) - limit} more")
+    return shown
 
 
 def echo_server_text(text: str, err: bool = False) -> None:

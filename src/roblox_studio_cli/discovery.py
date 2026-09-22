@@ -43,6 +43,8 @@ from roblox_studio_cli.client import DEFAULT_CALL_TOOL_TIMEOUT_SECONDS, StudioMc
 from roblox_studio_cli.errors import StudioNotAttachedError, StudioRequestError
 from roblox_studio_cli.mcp_payloads import ToolDefinition
 from roblox_studio_cli.terminal import (
+    MAX_ENUMERATED_NAMES,
+    capped_display_names,
     sanitize_diagnostic_line,
     sanitize_terminal_text,
     truncate_display_text,
@@ -275,6 +277,11 @@ def find_tool(tools: list[ToolDefinition], intent: ToolIntent) -> ToolMatch:
     raise ToolDiscoveryError(no_tool_message(tools, intent, ambiguous, rejected, destructive))
 
 
+def named_list(names: list[str]) -> str:
+    """Sorted, deduplicated tool names for one clause of a message, capped."""
+    return ", ".join(capped_display_names(sorted(set(names))))
+
+
 def no_tool_message(
     tools: list[ToolDefinition],
     intent: ToolIntent,
@@ -282,22 +289,25 @@ def no_tool_message(
     rejected: list[str],
     destructive: list[str],
 ) -> str:
-    """Explain a failed lookup: too many candidates, destructive or wrong-shaped ones, or none."""
+    """Explain a failed lookup: too many candidates, destructive or wrong-shaped ones, or none.
+
+    Every name in here was chosen by the server, so each list is capped: the
+    sentence that matters is the last one, and it has to survive a build that
+    exposes hundreds of tools.
+    """
     if ambiguous:
-        detail = f"Several tools could be it: {', '.join(sorted(set(ambiguous)))}."
+        detail = f"Several tools could be it: {named_list(ambiguous)}."
     elif destructive:
         detail = (
-            f"{', '.join(sorted(set(destructive)))} matched by name but carries a "
+            f"{named_list(destructive)} matched by name but carries a "
             "destructive verb, so no convenience command will call it."
         )
     elif rejected:
         wanted = ", ".join(intent.expected_arguments)
-        detail = (
-            f"{', '.join(sorted(set(rejected)))} matched by name but declares none of: {wanted}."
-        )
+        detail = f"{named_list(rejected)} matched by name but declares none of: {wanted}."
     else:
         detail = "Nothing matched by name."
-    available = ", ".join(sorted(tool.name for tool in tools)) or "(none)"
+    available = ", ".join(capped_display_names(sorted(tool.name for tool in tools))) or "(none)"
     return sanitize_terminal_text(
         f"no {intent.purpose} tool found in this Studio build. {detail} "
         f"Available tools: {available}. "
@@ -335,15 +345,19 @@ def check_required_arguments(tool: ToolDefinition, arguments: dict) -> None:
     """Fail before the call when the schema demands arguments the caller did not supply.
 
     Catching this locally produces an actionable message naming the missing keys,
-    rather than a server side rejection that has to be decoded.
+    rather than a server side rejection that has to be decoded. The schema
+    decides how many keys that is, and the server wrote the schema, so both the
+    names and the example `--args` stop at `MAX_ENUMERATED_NAMES`.
     """
     missing = [name for name in tool.required_argument_names if name not in arguments]
     if not missing:
         return
-    example = json.dumps({name: "..." for name in missing})
+    example = json.dumps({name: "..." for name in missing[:MAX_ENUMERATED_NAMES]})
+    named = ", ".join(capped_display_names(missing))
     raise ToolDiscoveryError(
         sanitize_terminal_text(
-            f"tool {tool.name!r} requires {', '.join(missing)}. Add them with --args '{example}'"
+            f"tool {sanitize_diagnostic_line(tool.name)!r} requires {named}. "
+            f"Add them with --args '{example}'"
         )
     )
 
@@ -498,7 +512,11 @@ def resolve_studio_id(
     if len(instances) == 1:
         return instances[0].identifier
 
-    listed = "\n".join(f"  {instance.describe()}" for instance in instances)
+    # The count is the bridge's answer and stays exact; the rows under it stop
+    # at MAX_ENUMERATED_NAMES, because the caller only needs enough to choose.
+    listed = "\n".join(
+        f"  {row}" for row in capped_display_names(item.describe() for item in instances)
+    )
     raise ToolDiscoveryError(
         f"{len(instances)} Studio instances are registered; pass --studio <id-or-name>:\n{listed}"
     )
@@ -518,13 +536,13 @@ def match_requested_instance(instances: list[StudioInstance], wanted: str) -> st
         if len(candidates) == 1:
             return candidates[0].identifier
         if len(candidates) > 1:
-            listed = ", ".join(item.describe() for item in candidates)
+            listed = ", ".join(capped_display_names(item.describe() for item in candidates))
             raise ToolDiscoveryError(
                 f"--studio {wanted!r} matches {len(candidates)} instances: {listed}. "
                 "Pass the id instead."
             )
 
-    known = ", ".join(instance.describe() for instance in instances)
+    known = ", ".join(capped_display_names(instance.describe() for instance in instances))
     raise ToolDiscoveryError(f"no Studio instance matches {wanted!r}. Registered: {known}")
 
 

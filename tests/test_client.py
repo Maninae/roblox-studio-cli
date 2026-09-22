@@ -24,6 +24,8 @@ import pytest
 from roblox_studio_cli import client as client_module
 from roblox_studio_cli.client import (
     PROXY_NO_TOOLS_STDERR_MARKER,
+    STDERR_MAX_LINE_BYTES,
+    STDERR_QUOTE_LINES,
     STUDIO_NOT_ENABLED_MESSAGE,
     StudioMcpClient,
 )
@@ -34,6 +36,7 @@ from roblox_studio_cli.errors import (
     StudioNotConnectedError,
 )
 from roblox_studio_cli.framing import MAX_MESSAGE_BYTES
+from roblox_studio_cli.terminal import MAX_DIAGNOSTIC_TEXT_CHARS
 
 FAKE_SERVER_PATH = Path(__file__).resolve().parent / "fake_studio_mcp_server.py"
 PNG_MAGIC_BYTES = b"\x89PNG\r\n\x1a\n"
@@ -162,6 +165,22 @@ def test_stderr_flood_neither_wedges_nor_is_kept(fake_client):
     recent = client.recent_stderr()
     assert "back to normal" in recent
     assert len(recent) < 10_000, "the over-long line was buffered instead of discarded"
+
+
+def test_quoted_stderr_is_capped_one_line_at_a_time():
+    """Six lines the proxy chose the length of used to be six lines of 64 KB.
+
+    The ring buffer bounds how many lines are kept and how long each may be on
+    the way in; this is the second half, bounding what an exception message
+    prints out of them.
+    """
+    client = StudioMcpClient(command=["/nonexistent/StudioMCP"])
+    for _ in range(STDERR_QUOTE_LINES + 4):
+        client.stderr_lines.append("x" * STDERR_MAX_LINE_BYTES)
+
+    suffix = client.stderr_suffix()
+    assert "Proxy stderr:" in suffix
+    assert len(suffix) < STDERR_QUOTE_LINES * (MAX_DIAGNOSTIC_TEXT_CHARS + 1) + 32, len(suffix)
 
 
 def test_malformed_frames_are_survivable(fake_client):

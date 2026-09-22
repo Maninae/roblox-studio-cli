@@ -44,6 +44,9 @@ What the pipe is doing (the transport's own hazards):
                    never answered: what Studio does with the display asleep
     capture-error  the capture comes back isError, with an image attached: a
                    failed call that still hands over bytes to write
+    crowded        forty extra tools and forty registered instances, so every
+                   message that enumerates what the server offers has to stop
+                   somewhere
 """
 
 import json
@@ -171,12 +174,32 @@ HOSTILE_NAME_TOOL = {
     },
 }
 
+# A build with a crowd of everything: enough tools and instances that a message
+# enumerating either has to stop somewhere. The names carry no keyword any
+# intent looks for, so discovery still finds the real tools among them.
+CROWD_SIZE = 40
+CROWD_TOOLS = [
+    {
+        "name": "insert_asset_%03d" % index,
+        "description": "One of many.",
+        "inputSchema": {
+            "type": "object",
+            "properties": dict(STUDIO_ID_PROPERTY),
+            "required": ["studio_id"],
+        },
+    }
+    for index in range(CROWD_SIZE)
+]
+
 # Served in two pages so the client's nextCursor handling is exercised.
 FIRST_PAGE_SIZE = 3
 SECOND_PAGE_CURSOR = "page-2"
 
 INSTANCES_BY_MODE = {
     "connected": [{"id": "studio-1", "name": "Baseplate"}],
+    "crowded": [
+        {"id": "studio-%d" % index, "name": "Place%d" % index} for index in range(CROWD_SIZE)
+    ],
     "giant-names": [{"id": "g" * GIANT_TEXT_CHARS, "name": "n" * GIANT_TEXT_CHARS}],
     "no-instances": [],
     "two-instances": [
@@ -241,6 +264,8 @@ def tools_list_result(params: dict, mode: str) -> dict:
     if mode == "huge-list":
         padded = dict(TOOL_DEFINITIONS[0], description="x" * HUGE_DESCRIPTION_BYTES)
         return {"tools": [padded]}
+    if mode == "crowded":
+        return {"tools": [*TOOL_DEFINITIONS, *CROWD_TOOLS]}
     if params.get("cursor") == SECOND_PAGE_CURSOR:
         return {"tools": TOOL_DEFINITIONS[FIRST_PAGE_SIZE:]}
     return {"tools": TOOL_DEFINITIONS[:FIRST_PAGE_SIZE], "nextCursor": SECOND_PAGE_CURSOR}

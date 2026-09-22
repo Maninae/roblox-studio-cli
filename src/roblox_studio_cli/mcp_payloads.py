@@ -20,7 +20,7 @@ import logging
 from dataclasses import dataclass, field
 
 from roblox_studio_cli.errors import StudioMcpError, StudioMcpProtocolError
-from roblox_studio_cli.terminal import sanitize_terminal_text
+from roblox_studio_cli.terminal import sanitize_terminal_text, truncate_display_text
 
 logger = logging.getLogger(__name__)
 
@@ -222,17 +222,28 @@ def raise_for_rpc_error(response: dict) -> None:
     """Raise `StudioMcpProtocolError` when a JSON-RPC response carries an error.
 
     Tolerates a server that sends a bare string where the spec wants an object,
-    which is the difference between a readable message and a traceback.
+    which is the difference between a readable message and a traceback. The
+    message is chrome around a failure and the server picks its length, so it is
+    capped like every other diagnostic field: a 5 MB message was 5 MB of stderr.
     """
     error = response.get("error")
     if error is None:
         return
     if not isinstance(error, dict):
-        raise StudioMcpProtocolError(code=-1, message=sanitize_terminal_text(str(error)))
+        raise StudioMcpProtocolError(code=-1, message=display_error_message(error))
     code = error.get("code")
     message = error.get("message")
     raise StudioMcpProtocolError(
         code=code if isinstance(code, int) else -1,
-        message=sanitize_terminal_text(str(message) if message is not None else "unknown error"),
+        message=display_error_message(message if message is not None else "unknown error"),
         data=error.get("data"),
     )
+
+
+def display_error_message(message: object) -> str:
+    """Server-chosen failure text, sanitised and capped, ready to print.
+
+    Line breaks survive the cap, because a bridge error is sometimes a short
+    stack and the shape of it is part of the diagnosis.
+    """
+    return truncate_display_text(sanitize_terminal_text(str(message)))

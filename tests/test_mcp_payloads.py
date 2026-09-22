@@ -17,6 +17,7 @@ from roblox_studio_cli.mcp_payloads import (
     parse_tool_call_result,
     raise_for_rpc_error,
 )
+from roblox_studio_cli.terminal import MAX_DIAGNOSTIC_TEXT_CHARS
 
 PNG_BYTES = b"\x89PNG\r\n\x1a\n" + b"payload"
 PNG_BASE64 = base64.b64encode(PNG_BYTES).decode()
@@ -113,3 +114,22 @@ def test_rpc_error_text_cannot_carry_escape_sequences():
     with pytest.raises(StudioMcpProtocolError) as raised:
         raise_for_rpc_error({"error": {"code": 1, "message": "bad\x1b]0;title\x07"}})
     assert "\x1b" not in str(raised.value)
+
+
+@pytest.mark.parametrize(
+    "envelope",
+    [
+        {"error": {"code": 1, "message": "x" * 5_000_000}},
+        {"error": "x" * 5_000_000},
+    ],
+)
+def test_a_giant_rpc_error_message_is_capped(envelope):
+    """The message is chrome around a failure, and the server chooses its length.
+
+    Measured: a 5 MB message printed as 5 MB of stderr, scrolling away the
+    command that caused it.
+    """
+    with pytest.raises(StudioMcpProtocolError) as raised:
+        raise_for_rpc_error(envelope)
+    assert len(raised.value.rpc_message) == MAX_DIAGNOSTIC_TEXT_CHARS
+    assert raised.value.rpc_message.endswith("...")

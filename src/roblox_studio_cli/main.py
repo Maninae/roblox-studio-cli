@@ -69,7 +69,11 @@ from roblox_studio_cli.errors import (
 )
 from roblox_studio_cli.image_output import save_images
 from roblox_studio_cli.mcp_payloads import ToolCallResult, ToolDefinition
-from roblox_studio_cli.terminal import echo_server_text, sanitize_single_line
+from roblox_studio_cli.terminal import (
+    capped_display_names,
+    echo_server_text,
+    sanitize_single_line,
+)
 
 EXIT_OK = 0
 EXIT_NOT_READY = 1
@@ -244,6 +248,15 @@ def emit_failed_result(result: ToolCallResult, as_json: bool) -> None:
         )
 
 
+def declared_arguments(tool: ToolDefinition) -> str:
+    """The argument names a tool declares, for a message that says it lacks one.
+
+    Server-chosen names, so the list is capped the way every other enumeration
+    of them is.
+    """
+    return ", ".join(capped_display_names(tool.argument_names)) or "none"
+
+
 def generate_capture_id() -> str:
     """A fresh id for one screen capture, unique enough for back-to-back calls."""
     return f"roblox-studio-{uuid.uuid4().hex[:CAPTURE_ID_RANDOM_CHARS]}"
@@ -408,7 +421,10 @@ def call(
         definitions = client.list_tools()
         definition = next((entry for entry in definitions if entry.name == tool), None)
         if definition is None:
-            available = ", ".join(sorted(entry.name for entry in definitions)) or "(none)"
+            # Server-chosen names, so the list is capped: the point of the
+            # message is the name the caller typed, not the catalogue.
+            names = capped_display_names(sorted(entry.name for entry in definitions))
+            available = ", ".join(names) or "(none)"
             raise ToolDiscoveryError(f"no tool named {tool!r}. Available tools: {available}")
         result = call_discovered_tool(client, definitions, definition, arguments, studio, timeout)
 
@@ -441,8 +457,8 @@ def luau(
         )
         if code_argument is None:
             raise ToolDiscoveryError(
-                f"tool {match.tool.name!r} has no argument that looks like Luau source "
-                f"(declared: {', '.join(match.tool.argument_names) or 'none'})"
+                f"tool {sanitize_single_line(match.tool.name)!r} has no argument that looks "
+                f"like Luau source (declared: {declared_arguments(match.tool)})"
             )
         arguments: dict = {code_argument: source}
 
@@ -556,8 +572,8 @@ def play(
         )
         if start_argument is None:
             raise ToolDiscoveryError(
-                f"tool {match.tool.name!r} has no start/stop argument "
-                f"(declared: {', '.join(match.tool.argument_names) or 'none'})"
+                f"tool {sanitize_single_line(match.tool.name)!r} has no start/stop argument "
+                f"(declared: {declared_arguments(match.tool)})"
             )
         arguments.setdefault(start_argument, start)
         result = call_discovered_tool(client, definitions, match.tool, arguments, studio, timeout)
