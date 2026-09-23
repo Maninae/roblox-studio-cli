@@ -212,3 +212,44 @@ def test_a_lister_that_never_answers_is_nothing_attached_rather_than_a_transport
     assert not outcome.attached
     spent = SHORT_ATTACH_WINDOW_SECONDS - STUDIO_ATTACH_POLL_INTERVAL_SECONDS
     assert outcome.elapsed_seconds >= spent, "it gave up before the window was gone"
+
+
+def test_no_poll_is_handed_a_deadline_that_has_already_passed():
+    """The sleep between polls can land on the deadline, and one used to poll anyway.
+
+    A poll with no time left cannot succeed: it spends a request id, fails
+    inside the read loop before `select` returns anything, and logs that the
+    lister did not answer inside the window. The lister was never asked. With a
+    1 s window and a 0.5 s interval the arithmetic lands there exactly, which is
+    what this reproduces.
+    """
+    client = NeverAttachingClient()
+
+    wait_for_studio_instances(
+        client,
+        LISTER_TOOLS,
+        timeout=GENEROUS_CALL_TIMEOUT_SECONDS,
+        attach_timeout=SHORT_ATTACH_WINDOW_SECONDS,
+    )
+
+    assert min(client.poll_timeouts) > 0, client.poll_timeouts
+
+
+def test_a_lister_that_never_answers_says_so_instead_of_blaming_the_place():
+    """Silence and "no studios" are the same outcome and different faults.
+
+    Both end as "no Studio instance attached", and the advice under that line is
+    about opening a place and checking the toggle. A bridge that answered
+    nothing at all deserves to be quoted the way a bridge that answered an error
+    already is, otherwise the one reading it goes looking at Studio.
+    """
+    client = NeverAttachingClient(failure=StudioMcpTimeoutError("no response to 'tools/call'"))
+
+    outcome = wait_for_studio_instances(
+        client,
+        LISTER_TOOLS,
+        timeout=GENEROUS_CALL_TIMEOUT_SECONDS,
+        attach_timeout=SHORT_ATTACH_WINDOW_SECONDS,
+    )
+
+    assert "no response to 'tools/call'" in attach_failure_message(outcome)

@@ -168,9 +168,15 @@ def wait_for_studio_instances(
         remaining = max(deadline - time.monotonic(), 0.0)
         try:
             result = client.call_tool(lister.name, {}, timeout=remaining)
-        except StudioMcpTimeoutError:
+        except StudioMcpTimeoutError as poll_error:
             # The poll held the rest of the window, so the window is gone, and
             # "nothing attached in time" is what the check below already says.
+            # What it does not say is that nothing answered at all, which is a
+            # different fault from a bridge that answered "no studios": quote it
+            # the way an error answer is quoted, or the advice sends the reader
+            # to Studio for a bridge that never spoke. "nothing" leads, because
+            # the line it lands under reads "The bridge last answered:".
+            last_error_text = f"nothing; {poll_error}"
             logger.debug("the instance lister did not answer inside the attach window")
         else:
             if result.is_error:
@@ -184,13 +190,21 @@ def wait_for_studio_instances(
                     )
 
         remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            return StudioAttachOutcome(
-                elapsed_seconds=time.monotonic() - started,
-                last_error_text=last_error_text,
-                window_seconds=window,
-            )
-        time.sleep(min(STUDIO_ATTACH_POLL_INTERVAL_SECONDS, remaining))
+        if remaining > 0:
+            time.sleep(min(STUDIO_ATTACH_POLL_INTERVAL_SECONDS, remaining))
+            # Re-read the clock AFTER the sleep: with a 1 s window and a 0.5 s
+            # interval it lands exactly on the deadline, and the poll that
+            # followed was handed nothing. A poll with no time left cannot
+            # reach the bridge at all; it spends a request id, fails inside the
+            # read loop, and logs that the lister went quiet when it was never
+            # asked.
+            if time.monotonic() < deadline:
+                continue
+        return StudioAttachOutcome(
+            elapsed_seconds=time.monotonic() - started,
+            last_error_text=last_error_text,
+            window_seconds=window,
+        )
 
 
 def no_studio_instance_message(window_seconds: float) -> str:
