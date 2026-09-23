@@ -22,6 +22,14 @@ the read forever, and a path can be swapped between a check and a later open.
 `O_NONBLOCK` is what makes the open itself safe to attempt, since a FIFO with
 no writer blocks inside `open()` before any check could run.
 
+Whatever the door, the same two things happen to the text at the end of it:
+every leading BOM comes off, and source that carries nothing a compiler could
+read is refused. Both used to be per-door and inconsistent. A `--file` lost its
+BOM and the argument kept one (`luau $'\ufeff'` reached Studio); a file with two
+of them kept the second; and "empty" was `str.strip()`, which is whitespace
+only, so a source of one BOM, one zero-width space or one NUL passed as a
+script. They are all the same mistake arriving in a different costume.
+
 Split out of `main` so the command surface stays about flags, output and exit
 codes: this module answers one question (what source did the caller mean?) and
 knows nothing about Typer or about the bridge.
@@ -30,6 +38,7 @@ knows nothing about Typer or about the bridge.
 import os
 import stat
 import sys
+import unicodedata
 from pathlib import Path
 
 from roblox_studio_cli.errors import StudioRequestError
@@ -45,7 +54,14 @@ MAX_LUAU_SOURCE_BYTES = 8 * 2**20
 # Every door's answer to a request that carries no script.
 NO_SOURCE_MESSAGE = "provide Luau source as an argument, `-` to read stdin, or --file PATH"
 # Invisible in an editor, a syntax error to Luau: an editor's BOM is not source.
-BYTE_ORDER_MARK = "﻿"
+# Written as the escape on purpose, because the literal character is invisible
+# in this file too, and a reader cannot tell it from a stray space.
+BYTE_ORDER_MARK = "\ufeff"
+# Categories that carry no script: Cc is the control characters, NUL included,
+# and Cf is every format character, which is the BOM, the zero-width set and
+# the bidi marks. With whitespace, that is everything a source can be made
+# entirely of and still be empty.
+INVISIBLE_SOURCE_CATEGORIES = frozenset({"Cc", "Cf"})
 
 
 def read_luau_source(code: str | None, file_path: Path | None) -> str:
@@ -70,16 +86,37 @@ def read_luau_source(code: str | None, file_path: Path | None) -> str:
 
 
 def require_luau_source(source: str) -> str:
-    """Refuse a request that carries no script, whichever door it came in by.
+    """Strip what an editor added, then refuse a request that carries no script.
 
-    An empty argument, an empty file and an empty pipe are all the same
-    mistake, and all three used to spend a proxy spawn, a `tools/list` and a
-    `tools/call` on sending nothing to Studio, which answers that with nothing.
-    Whitespace counts as empty: a file holding one newline is not a script.
+    The one gate all three doors pass through, which is what keeps them from
+    drifting apart. An empty argument, an empty file and an empty pipe are the
+    same mistake, and all three used to spend a proxy spawn, a `tools/list` and
+    a `tools/call` on sending nothing to Studio, which answers that with
+    nothing.
+
+    "Empty" is wider than `str.strip()`, which only knows whitespace: a source
+    of one BOM, one zero-width space or one NUL is invisible in an editor and
+    is not a script either, and all three used to pass. Leading BOMs come off
+    first, all of them, because a file that has been through two editors has
+    two.
     """
-    if not source.strip():
+    source = source.lstrip(BYTE_ORDER_MARK)
+    if not carries_a_script(source):
         raise StudioRequestError(NO_SOURCE_MESSAGE)
     return source
+
+
+def carries_a_script(source: str) -> bool:
+    """True when `source` holds one character a Luau compiler could read.
+
+    Short-circuits on the first such character, so an ordinary script costs one
+    comparison and only an all-invisible one is walked to the end.
+    """
+    return any(
+        not character.isspace()
+        and unicodedata.category(character) not in INVISIBLE_SOURCE_CATEGORIES
+        for character in source
+    )
 
 
 def read_bounded_stdin() -> str:
@@ -112,7 +149,7 @@ def read_bounded_stdin() -> str:
             f"the Luau source on stdin is over {MAX_LUAU_SOURCE_BYTES} bytes, which is where "
             "`-` is capped, the same as --file.",
         )
-        return strip_byte_order_mark(raw.decode("utf-8"))
+        return raw.decode("utf-8")
     except (OSError, UnicodeDecodeError) as stdin_error:
         raise StudioRequestError(
             f"cannot read Luau source from stdin: {stdin_error}"
@@ -158,7 +195,7 @@ def read_bounded_file(file_path: Path) -> str:
             f"{file_path} is over {MAX_LUAU_SOURCE_BYTES} bytes; --file is capped at "
             f"{MAX_LUAU_SOURCE_BYTES} bytes.",
         )
-        return strip_byte_order_mark(raw.decode("utf-8"))
+        return raw.decode("utf-8")
     except (OSError, UnicodeDecodeError) as read_error:
         raise StudioRequestError(f"cannot read {file_path}: {read_error}") from read_error
 
@@ -168,7 +205,3 @@ def refuse_oversized_source(over_the_cap: bool, detail: str) -> None:
     if over_the_cap:
         raise StudioRequestError(f"{detail} Read it in Studio instead of sending it.")
 
-
-def strip_byte_order_mark(source: str) -> str:
-    """Drop a leading BOM, which an editor writes and Luau will not compile."""
-    return source[len(BYTE_ORDER_MARK):] if source.startswith(BYTE_ORDER_MARK) else source

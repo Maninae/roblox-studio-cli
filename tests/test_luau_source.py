@@ -31,7 +31,8 @@ from roblox_studio_cli.luau_source import MAX_LUAU_SOURCE_BYTES, read_luau_sourc
 
 ASTRAL_CHARACTER = "\U0001f600"
 ASTRAL_BYTES = ASTRAL_CHARACTER.encode("utf-8")
-BYTE_ORDER_MARK = "﻿"
+BYTE_ORDER_MARK = "\ufeff"
+ZERO_WIDTH_SPACE = "\u200b"
 
 
 class FakeStdin:
@@ -189,3 +190,39 @@ def test_a_file_of_whitespace_is_not_a_script(tmp_path):
 def test_a_script_that_is_only_a_comment_still_counts_as_source():
     """Refusing empty must not start refusing scripts that merely do nothing."""
     assert read_luau_source("-- nothing to see", None) == "-- nothing to see"
+
+
+@pytest.mark.parametrize(
+    "source, reason",
+    [
+        (BYTE_ORDER_MARK, "a BOM is what an editor wrote, not what the caller typed"),
+        (BYTE_ORDER_MARK * 2, "and a file through two editors has two of them"),
+        (ZERO_WIDTH_SPACE, "a zero-width space is not a statement"),
+        ("\x00", "nor is a NUL, which `strip()` does not know about"),
+        (f" {BYTE_ORDER_MARK}\t{ZERO_WIDTH_SPACE}\n", "nor all of them together"),
+    ],
+)
+def test_a_source_of_invisible_characters_is_an_empty_source(source, reason):
+    """`str.strip()` only knows whitespace, so each of these passed as a script.
+
+    Every one of them cost a proxy spawn, a `tools/list` and a `tools/call` to
+    hand Studio something it cannot compile, through the one door that never
+    stripped anything: the argument.
+    """
+    with pytest.raises(StudioRequestError, match="provide Luau source"):
+        read_luau_source(source, None)
+
+
+def test_the_argument_door_loses_a_byte_order_mark_too(tmp_path):
+    """A BOM pasted into an argument is the same BOM a file carries."""
+    assert read_luau_source(BYTE_ORDER_MARK + "return 1", None) == "return 1"
+
+    script = tmp_path / "twice.luau"
+    script.write_text(BYTE_ORDER_MARK * 2 + "return 2", encoding="utf-8")
+    assert read_luau_source(None, script) == "return 2", "the second BOM survived"
+
+
+def test_an_invisible_character_inside_a_script_is_left_alone():
+    """Refusing invisible-only source must not start editing source that has one in it."""
+    source = f'return "a{ZERO_WIDTH_SPACE}b"'
+    assert read_luau_source(source, None) == source
