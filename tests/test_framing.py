@@ -47,6 +47,11 @@ MAX_PEAK_BYTES_PER_FRAME = 2.5
 # the failure they guard against is measured in minutes and CI is shared.
 HOSTILE_FRAME_SECONDS = 1.0
 LARGE_HOSTILE_FRAME_SECONDS = 2.0
+# How much cheaper the BOUNDED trim has to be than the walk it replaced. An
+# absolute budget cannot see that regression at all: with the bound reverted,
+# 4 MB of padding still walks in 0.098 s against the 1.0 s above, so the test
+# passed on the code it exists to fail. Measured here: 48x to 77x.
+MIN_TRIM_SPEEDUP = 10
 
 
 def drain(reader: StdoutFrameReader) -> list[dict]:
@@ -80,6 +85,24 @@ def frame_quoting_another_id_first(own_id) -> bytes:
         "id": own_id,
     }
     return json.dumps(body).encode("utf-8") + b"\n"
+
+
+def unbounded_trim_seconds(frame: bytes) -> float:
+    """Wall time for the trim `strip_frame_bytes` would do with its bound removed.
+
+    The same per-byte loop over the same bytes, through a memoryview, which is
+    what the bounded version walks. It is measured in the test rather than
+    written down as a number, because a wall-clock constant is a fact about one
+    machine: the assertion has to mean the same thing on a loaded CI runner,
+    where both sides slow down together and only the ratio between them holds.
+    """
+    started = time.monotonic()
+    with memoryview(frame) as view:
+        index = 0
+        end = len(view)
+        while index < end and view[index] in framing_module.FRAME_WHITESPACE_BYTES:
+            index += 1
+    return time.monotonic() - started
 
 
 @contextmanager
@@ -241,10 +264,18 @@ def test_a_frame_padded_with_whitespace_stays_as_cheap_as_a_newline_flood():
     to stay linear with a small constant. Walking 8 MB of spaces one byte at a
     time takes 234 ms against 2.3 ms in C, which is why the walk stops early
     and hands a frame padded past the window back to `strip()`.
+
+    The assertion is a RATIO against that unbounded walk, measured alongside it
+    on the same bytes, because the absolute budget this used to carry does not
+    discriminate: revert the bound and 4 MB of padding still walks in 0.098 s,
+    well inside a 1.0 s budget, so the test passed on exactly the code it was
+    written to fail. The budget stays as well, to catch a bounded path that
+    went slow in some way the ratio cannot see.
     """
     frame = b" " * (MAX_MESSAGE_BYTES // 2) + b"\n"
     reader = StdoutFrameReader()
     reader.begin_request(MAX_TOOLS_LIST_TOTAL_BYTES)
+    unbounded = unbounded_trim_seconds(frame)
 
     started = time.monotonic()
     reader.feed(frame, awaited_id=AWAITED_ID)
@@ -253,6 +284,10 @@ def test_a_frame_padded_with_whitespace_stays_as_cheap_as_a_newline_flood():
     assert drain(reader) == [], "whitespace is not a frame"
     assert reader.bytes_consumed == framing_module.EMPTY_FRAME_BUDGET_BYTES
     assert elapsed < HOSTILE_FRAME_SECONDS, f"{len(frame)} bytes of padding took {elapsed:.2f}s"
+    assert elapsed * MIN_TRIM_SPEEDUP < unbounded, (
+        f"{len(frame)} bytes of padding took {elapsed * 1000:.0f} ms, against "
+        f"{unbounded * 1000:.0f} ms walked unbounded: the bound is not being hit"
+    )
 
 
 def test_an_unterminated_string_is_noise_rather_than_a_depth_error():
