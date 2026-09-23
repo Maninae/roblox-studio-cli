@@ -346,14 +346,20 @@ def check_required_arguments(tool: ToolDefinition, arguments: dict) -> None:
 
     Catching this locally produces an actionable message naming the missing keys,
     rather than a server side rejection that has to be decoded. The schema
-    decides how many keys that is, and the server wrote the schema, so both the
-    names and the example `--args` stop at `MAX_ENUMERATED_NAMES`.
+    decides how many keys that is AND how long each one is, and the server wrote
+    the schema, so the example is built from the same capped display names the
+    naming clause uses. Built from the raw names, it put a 1,000,000-character
+    argument key on stderr in full, on one line, after the clause above it had
+    been capped.
     """
     missing = [name for name in tool.required_argument_names if name not in arguments]
     if not missing:
         return
-    example = json.dumps({name: "..." for name in missing[:MAX_ENUMERATED_NAMES]})
-    named = ", ".join(capped_display_names(missing))
+    shown = capped_display_names(missing)
+    # Slicing past the cap drops the "and N more" tail, which is a sentence
+    # rather than an argument name and has no business inside the JSON example.
+    example = json.dumps({name: "..." for name in shown[:MAX_ENUMERATED_NAMES]})
+    named = ", ".join(shown)
     raise ToolDiscoveryError(
         sanitize_terminal_text(
             f"tool {sanitize_diagnostic_line(tool.name)!r} requires {named}. "

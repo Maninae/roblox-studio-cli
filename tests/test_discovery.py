@@ -256,6 +256,21 @@ def test_a_crowd_of_missing_arguments_is_named_only_as_far_as_it_is_useful():
     assert len(message) < 1000, message
 
 
+def test_a_giant_argument_name_is_capped_in_the_example_as_well_as_the_list():
+    """The names are display text in both clauses, and the example is the longer one.
+
+    Measured: a schema requiring one 1,000,000-character argument name put all
+    of it on stderr, inside the `--args '{...}'` example, because only the
+    naming clause went through the cap.
+    """
+    giant = build_tool("x", {"a" * 1_000_000: STRING}, ["a" * 1_000_000])
+    with pytest.raises(ToolDiscoveryError) as raised:
+        check_required_arguments(giant, {})
+    message = str(raised.value)
+    assert "--args" in message, "the advice was dropped along with the length"
+    assert len(message) < MAX_DIAGNOSTIC_TEXT_CHARS * 4, len(message)
+
+
 def test_check_required_arguments_passes_when_complete():
     check_required_arguments(LUAU_TOOL, {"code": "x", "datamodel_type": "Edit", "studio_id": "s"})
 
