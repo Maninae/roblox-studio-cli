@@ -169,6 +169,13 @@ def truncate_display_text(text: str, limit: int = MAX_DIAGNOSTIC_TEXT_CHARS) -> 
     Apply it AFTER sanitising, never before: a field padded with escape
     sequences would otherwise spend the budget on characters that are about to
     be stripped, and arrive truncated for no reason.
+
+    The unit is code points, not terminal columns, and those are not the same
+    thing: CJK and emoji are double-width, so 200 of them occupy 400 columns
+    and wrap a narrow terminal onto a few lines. That is the accepted reading
+    of this cap. What it is for is the 6 MB serverInfo name, and measuring
+    columns (`unicodedata.east_asian_width` per character) would buy a tighter
+    wrap on a line that is already bounded to a handful of them.
     """
     if len(text) <= limit:
         return text

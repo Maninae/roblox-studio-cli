@@ -33,7 +33,11 @@ import re
 from collections import deque
 from functools import lru_cache
 
-from roblox_studio_cli.errors import StudioMcpError, StudioMcpProtocolError
+from roblox_studio_cli.errors import (
+    UNKNOWN_ERROR_CODE,
+    StudioMcpError,
+    StudioMcpProtocolError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -191,7 +195,7 @@ class StdoutFrameReader:
             return None
         except (ValueError, RecursionError) as frame_error:
             raise StudioMcpProtocolError(
-                code=-1,
+                code=UNKNOWN_ERROR_CODE,
                 message=(
                     f"the proxy sent a {len(line)} byte frame this build cannot read "
                     f"({type(frame_error).__name__})"

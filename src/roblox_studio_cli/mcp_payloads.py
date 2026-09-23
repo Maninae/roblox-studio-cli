@@ -20,7 +20,11 @@ import base64
 import logging
 from dataclasses import dataclass, field
 
-from roblox_studio_cli.errors import StudioMcpError, StudioMcpProtocolError
+from roblox_studio_cli.errors import (
+    UNKNOWN_ERROR_CODE,
+    StudioMcpError,
+    StudioMcpProtocolError,
+)
 from roblox_studio_cli.terminal import sanitize_terminal_text, truncate_display_text
 
 logger = logging.getLogger(__name__)
@@ -306,11 +310,14 @@ def raise_for_rpc_error(response: dict) -> None:
     if error is None:
         return
     if not isinstance(error, dict):
-        raise StudioMcpProtocolError(code=-1, message=display_error_message(error))
-    code = error.get("code")
+        raise StudioMcpProtocolError(
+            code=UNKNOWN_ERROR_CODE, message=display_error_message(error)
+        )
     message = error.get("message")
     raise StudioMcpProtocolError(
-        code=code if isinstance(code, int) else -1,
+        # Whatever the server put there: the exception normalises the type and
+        # bounds the length, so both rules live in one place.
+        code=error.get("code"),
         message=display_error_message(message if message is not None else "unknown error"),
         data=error.get("data"),
     )

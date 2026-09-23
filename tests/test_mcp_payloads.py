@@ -11,7 +11,12 @@ import logging
 import pytest
 
 from roblox_studio_cli import mcp_payloads as mcp_payloads_module
-from roblox_studio_cli.errors import StudioMcpError, StudioMcpProtocolError
+from roblox_studio_cli.errors import (
+    MAX_ERROR_CODE_CHARS,
+    UNKNOWN_ERROR_CODE,
+    StudioMcpError,
+    StudioMcpProtocolError,
+)
 from roblox_studio_cli.mcp_payloads import (
     MAX_ECHOED_REQUEST_ID_CHARS,
     METHOD_NOT_FOUND_CODE,
@@ -206,6 +211,29 @@ def test_raise_for_rpc_error_reads_both_shapes():
     with pytest.raises(StudioMcpProtocolError) as bare:
         raise_for_rpc_error({"error": "boom"})
     assert bare.value.code == -1 and "boom" in str(bare.value)
+
+
+def test_a_boolean_error_code_is_not_the_integer_it_equals():
+    """`True` is an `int` in Python, so an isinstance check read this as error 1."""
+    with pytest.raises(StudioMcpProtocolError) as raised:
+        raise_for_rpc_error({"error": {"code": True, "message": "boom"}})
+    assert raised.value.code == UNKNOWN_ERROR_CODE
+    assert f"JSON-RPC error {UNKNOWN_ERROR_CODE}" in str(raised.value)
+
+
+def test_a_giant_error_code_is_capped_where_it_prints():
+    """A Python integer has no width limit, and the server picks this one.
+
+    Measured: `10 ** 4000` put 4,028 characters of chrome in front of the
+    message the caller needs. The value survives on the exception; the line
+    that gets printed does not carry it.
+    """
+    enormous = 10**4000
+    with pytest.raises(StudioMcpProtocolError) as raised:
+        raise_for_rpc_error({"error": {"code": enormous, "message": "boom"}})
+    assert raised.value.code == enormous, "the code itself was thrown away"
+    capped = "1" + "0" * (MAX_ERROR_CODE_CHARS - 1)
+    assert str(raised.value) == f"JSON-RPC error {capped}...: boom"
 
 
 def test_rpc_error_text_cannot_carry_escape_sequences():

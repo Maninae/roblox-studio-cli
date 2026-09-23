@@ -15,6 +15,36 @@ and the image writer can all raise the same classes without importing each
 other. `main.exit_code_for` is the only place that turns a class into a number.
 """
 
+# What a JSON-RPC `code` becomes when the server did not send an integer.
+UNKNOWN_ERROR_CODE = -1
+# How much of the code is worth printing. A server picks it, Python integers
+# have no width limit, and `10 ** 4000` printed 4,028 characters of chrome in
+# front of the message the caller actually needs. Same rule as every other
+# server-chosen field; this one is a number, so it needs no sanitising, only a
+# length.
+MAX_ERROR_CODE_CHARS = 20
+ERROR_CODE_TRUNCATION_MARKER = "..."
+
+
+def normalize_error_code(code: object) -> int:
+    """The integer a JSON-RPC error carried, or -1 when it carried something else.
+
+    Booleans are excluded explicitly: `True` is an `int` in Python, so an
+    `isinstance` check read `"code": true` as error 1, which is a code the spec
+    does not define and a claim the server never made.
+    """
+    if isinstance(code, bool) or not isinstance(code, int):
+        return UNKNOWN_ERROR_CODE
+    return code
+
+
+def display_error_code(code: int) -> str:
+    """The code as it prints, capped at a length no server chooses."""
+    text = str(code)
+    if len(text) <= MAX_ERROR_CODE_CHARS:
+        return text
+    return text[:MAX_ERROR_CODE_CHARS] + ERROR_CODE_TRUNCATION_MARKER
+
 
 class StudioMcpError(Exception):
     """Base class for every failure this package raises. Exits 1."""
@@ -44,11 +74,14 @@ class StudioMcpProtocolError(StudioMcpError):
     """The server answered with a JSON-RPC `error` object, or with an unreadable frame.
 
     `message` is already sanitised by the caller, since it is server-controlled
-    text that ends up on a terminal.
+    text that ends up on a terminal. `code` is normalised here instead: it is a
+    number, so there is nothing in it to sanitise, only a type to check and a
+    length to bound.
     """
 
-    def __init__(self, code: int, message: str, data: object = None):
-        super().__init__(f"JSON-RPC error {code}: {message}")
+    def __init__(self, code: object, message: str, data: object = None):
+        code = normalize_error_code(code)
+        super().__init__(f"JSON-RPC error {display_error_code(code)}: {message}")
         self.code = code
         self.rpc_message = message
         self.data = data

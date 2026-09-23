@@ -49,6 +49,7 @@ from collections import deque
 
 from roblox_studio_cli import __version__
 from roblox_studio_cli.errors import (
+    UNKNOWN_ERROR_CODE,
     StudioMcpError,
     StudioMcpProtocolError,
     StudioMcpTimeoutError,
@@ -255,7 +256,7 @@ class StudioMcpClient:
             entries = result.get("tools", [])
             if not isinstance(entries, list):
                 raise StudioMcpProtocolError(
-                    code=-1, message="tools/list returned a non-list `tools` member"
+                    code=UNKNOWN_ERROR_CODE, message="tools/list returned a non-list `tools` member"
                 )
             tools.extend(build_tool_definitions(entries))
 
@@ -330,7 +331,7 @@ class StudioMcpClient:
         result = response.get("result")
         if not isinstance(result, dict):
             raise StudioMcpProtocolError(
-                code=-1,
+                code=UNKNOWN_ERROR_CODE,
                 message=f"{method} returned a non-object result ({type(result).__name__})",
             )
         return result
