@@ -50,6 +50,10 @@ FRAME_ID_PEEK_BYTES = 4096
 # must not match, so such a frame falls through to the ordinary parse path.
 FRAME_ID_PATTERN = re.compile(rb'"id"\s*:\s*([0-9]{1,18})(?![0-9])')
 NON_JSON_PREVIEW_CHARS = 200
+# What an empty line costs the request's budget. Nothing is parsed or queued for
+# one, but each still costs a find, a slice and a delete, and charged nothing at
+# all a flood of them was the one hazard no bound applied to.
+EMPTY_FRAME_BUDGET_BYTES = 1
 # One pattern per in-flight request id, and ids only ever count upward.
 AWAITED_ID_PATTERN_CACHE_SIZE = 32
 
@@ -105,8 +109,9 @@ class StdoutFrameReader:
         """Split whole lines off the buffer and queue the ones that parse as JSON.
 
         Scanning restarts where the previous scan stopped. A large frame addressed
-        elsewhere is dropped before it is parsed, and only what is parsed is
-        charged against the request's byte budget.
+        elsewhere is dropped before it is parsed; everything else is charged
+        against the request's byte budget, an empty line included, so a flood of
+        bare newlines ends the same way a flood of frames does.
         """
         while True:
             newline_index = self.buffer.find(b"\n", self.scan_position)
@@ -117,6 +122,7 @@ class StdoutFrameReader:
             del self.buffer[: newline_index + 1]
             self.scan_position = 0
             if not line:
+                self.charge_request_bytes(EMPTY_FRAME_BUDGET_BYTES)
                 continue
             if self.frame_answers_another_request(line, awaited_id):
                 self.skipped_large_frames += 1

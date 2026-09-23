@@ -120,6 +120,26 @@ def test_a_request_cannot_parse_more_than_its_byte_budget():
         reader.feed(b'{"id": 1, "pad": "' + b"x" * 200 + b'"}\n')
 
 
+def test_a_flood_of_bare_newlines_ends_at_the_budget_like_everything_else():
+    """Nothing is queued for an empty line, so the budget is the only thing that can end it.
+
+    Each one still costs a find, a slice and a delete, and they were charged
+    nothing at all, so the one bound the documented limits name did not apply.
+    """
+    reader = StdoutFrameReader()
+    reader.begin_request(byte_budget=100)
+    with pytest.raises(StudioMcpError, match="budget"):
+        reader.feed(b"\n" * 200)
+
+
+def test_a_handful_of_blank_lines_costs_almost_nothing():
+    """The charge is per newline, so ordinary trailing whitespace stays free enough."""
+    reader = StdoutFrameReader()
+    reader.begin_request(byte_budget=100)
+    reader.feed(b"\n\n\n")
+    assert reader.bytes_consumed == 3
+
+
 def test_each_request_starts_its_budget_over():
     reader = StdoutFrameReader()
     reader.begin_request(byte_budget=100)
