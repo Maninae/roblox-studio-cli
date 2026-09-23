@@ -66,7 +66,7 @@ Shared flags:
 - `--studio <id-or-name>` picks the target when several Studio windows are open. `ROBLOX_STUDIO_ID` does the same. With exactly one open, it is inferred.
 - `--timeout <seconds>` bounds a single call, and with it the wait for Studio to attach.
 - `--args '<json>'` adds or overrides arguments on any subcommand, which is the escape hatch when a Studio build wants something the flags do not cover.
-- `--out <path>` plus `--force` on `screenshot` and `call`, for tools that return images.
+- `--out <path>` plus `--force` on `screenshot` and `call`, for tools that return images. `--out` is the request for a file, so it is honoured in both output modes; `--json` with no `--out` writes nothing, because the payload is already in the JSON.
 
 `screenshot` prints the path it wrote, and two things about it are worth knowing.
 

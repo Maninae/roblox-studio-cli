@@ -100,7 +100,9 @@ class ToolImage:
         Raises:
             StudioMcpError: the tool declared no type, or one this build does
                 not recognise. Guessing `.png` here would put a wrong extension
-                on a file someone then opens, so an unknown type is fatal.
+                on a file someone then opens, so an unknown type is fatal. The
+                advice names the one invocation that does not need a filename,
+                which is `--json` with no `--out`.
         """
         declared = self.mime_type.strip().lower()
         extension = IMAGE_MIME_TYPE_TO_FILE_EXTENSION.get(declared)
@@ -109,7 +111,8 @@ class ToolImage:
             described = declared or "(none declared)"
             raise StudioMcpError(
                 f"tool returned image content of unsupported type {described!r}. "
-                f"Known types: {known}. Use --json to get the payload as-is."
+                f"Known types: {known}. Rerun with --json and no --out for the payload "
+                "as sent."
             )
         return extension
 

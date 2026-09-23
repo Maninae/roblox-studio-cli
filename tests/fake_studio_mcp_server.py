@@ -60,6 +60,8 @@ What the pipe is doing (the transport's own hazards):
                    to survive
     lone-surrogate a `\\udcff` escape in the server name, the instance name and
                    a tool result: legal JSON, and unencodable as UTF-8
+    odd-mime       the capture comes back as an image type no build can name a
+                   file extension for, so the bytes exist and the file cannot
 """
 
 import json
@@ -116,6 +118,10 @@ DECOY_RECORD_ID = 999_999
 # Over the client's 4 MB whole-list budget, under its 8 MB per-frame cap.
 HUGE_DESCRIPTION_BYTES = 5 * 2**20
 DEAF_SLEEP_SECONDS = 30
+
+# An image type this CLI cannot turn into a filename. Guessing `.png` would put
+# the wrong extension on a file someone then opens, so the call has to fail.
+UNKNOWN_IMAGE_MIME_TYPE = "image/x-roblox-capture"
 
 # 1x1 transparent PNG, small enough to inline and still a real decodable image.
 ONE_PIXEL_PNG_BASE64 = (
@@ -374,8 +380,9 @@ def handle_tools_call(request_id: int, params: dict, mode: str) -> Optional[dict
     elif name == "screen_capture":
         # A failing tool can still attach content, and a client that writes the
         # file before reading isError hands the caller a picture of nothing.
+        mime_type = UNKNOWN_IMAGE_MIME_TYPE if mode == "odd-mime" else "image/png"
         result = {
-            "content": [{"type": "image", "data": ONE_PIXEL_PNG_BASE64, "mimeType": "image/png"}],
+            "content": [{"type": "image", "data": ONE_PIXEL_PNG_BASE64, "mimeType": mime_type}],
             "isError": mode == "capture-error",
         }
     elif name == "boom_tool":

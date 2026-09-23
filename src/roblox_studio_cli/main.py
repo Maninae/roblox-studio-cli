@@ -206,14 +206,20 @@ def emit_result(
     a file for a capture that never happened, having spent the single `--force`
     they granted on overwriting the good copy that was already there.
 
-    Images are written in both output modes, because `--out` is an explicit
-    request for the file; `--json` only changes what goes to stdout. A file
-    whose contents do not match the extension the caller asked for is reported
-    on stderr in both modes, and never renamed.
+    `--out` is the request for a file, so it is honoured in both output modes;
+    `--json` only changes what goes to stdout, and a file whose contents do not
+    match the extension the caller asked for is reported on stderr in both, and
+    never renamed. `--json` with NO `--out` writes nothing at all: the payload
+    is in the JSON, and the temp file the CLI used to write went into every
+    such call's output as a path the JSON did not mention.
     """
     if result.is_error:
         emit_failed_result(result, as_json)
         raise typer.Exit(EXIT_NOT_READY)
+
+    if as_json and out_path is None:
+        typer.echo(json.dumps(result.raw, indent=2))
+        return
 
     written = save_images(result.images, tool_name, out_path, force)
     for image in written:

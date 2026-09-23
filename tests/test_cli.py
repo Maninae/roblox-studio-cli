@@ -12,6 +12,7 @@ Exit codes are the contract worth protecting, so they are asserted everywhere:
 import ast
 import json
 import os
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -46,6 +47,11 @@ def invoke(arguments: list[str], mode: str = "connected", **kwargs):
         env={"ROBLOX_STUDIO_MCP_BIN": str(FAKE_SERVER_PATH), "FAKE_STUDIO_MODE": mode},
         **kwargs,
     )
+
+
+def temporary_captures() -> set[Path]:
+    """Every default-path capture sitting in the temp directory right now."""
+    return set(Path(tempfile.gettempdir()).glob("studio_screen_capture_*"))
 
 
 def all_output(result) -> str:
@@ -272,6 +278,32 @@ def test_screenshot_writes_the_file_even_in_json_mode(tmp_path):
     assert result.exit_code == EXIT_OK
     assert '"mimeType": "image/png"' in result.output
     assert destination.exists()
+
+
+def test_json_without_out_writes_no_file_the_payload_does_not_name():
+    """The JSON carries the image; a temp file nobody is told about is an orphan.
+
+    `--out` is the request for a file. Without it, `--json` used to write a
+    temp capture whose path appeared nowhere in the JSON, so every such call
+    left a file behind that only `ls /tmp` could find.
+    """
+    before = temporary_captures()
+    result = invoke(["screenshot", "--json"])
+    assert result.exit_code == EXIT_OK, all_output(result)
+    assert '"mimeType": "image/png"' in result.output, "the payload has to be in the JSON"
+    assert temporary_captures() == before, "a temp capture the JSON never names"
+
+
+def test_the_advice_on_an_unwritable_result_is_a_command_that_works(tmp_path):
+    """"Use --json" was a dead end while --json wrote the files too: exit 1 either way."""
+    result = invoke(["screenshot", "--out", str(tmp_path / "shot.zzz"), "--json"], mode="odd-mime")
+    assert result.exit_code == EXIT_NOT_READY
+    advice = all_output(result)
+    assert "--json and no --out" in advice, advice
+
+    followed = invoke(["screenshot", "--json"], mode="odd-mime")
+    assert followed.exit_code == EXIT_OK, all_output(followed)
+    assert '"mimeType": "image/x-roblox-capture"' in followed.output
 
 
 def test_screenshot_refuses_to_overwrite_without_force(tmp_path):
