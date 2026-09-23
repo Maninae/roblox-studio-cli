@@ -14,15 +14,21 @@ carries. So this module treats all three as hostile.
   anything that is not a regular file (a FIFO would block the process), never
   written to a path that shares its inode with another name (truncating one
   hard link rewrites the file under all of them), and never silently
-  overwritten: opening uses `O_NOFOLLOW`, plus `O_EXCL` unless `--force` says
-  otherwise.
+  overwritten: creating uses `O_NOFOLLOW | O_EXCL`, and a `--force`
+  replacement fills a temp file beside the target and renames it into place.
+  Rename replaces a name rather than following it, and it is what makes a
+  failed write (a full disk) leave the previous capture untouched.
 - The server does not get to decide how many files land. A result carrying more
   than `MAX_IMAGES_PER_RESULT` images is refused with nothing written, and
   `--force` licenses overwriting the one path the caller named, never the
   `-2`, `-3` siblings.
 - Every frame is decoded and signature-checked before any of them is written,
   because a result whose later frame is a mislabelled payload used to leave the
-  earlier ones on disk for a call the CLI then reported as failed.
+  earlier ones on disk for a call the CLI then reported as failed. Every
+  TARGET is checked before any of them is opened, for the same reason: with a
+  `-2` sibling already on disk, `--out a.png --force` used to overwrite
+  `a.png`, meet the sibling, and exit 2 having spent the caller's one `--force`
+  on a call it then reported as failed.
 - A mismatch between the caller's extension and the MIME type the tool returned
   is reported, never fixed: renaming the caller's `--out` behind their back is
   worse than handing them a `.png` that holds JPEG bytes and saying so.
@@ -31,6 +37,7 @@ The payload itself is checked in `mcp_payloads.ToolImage.decoded_bytes`, which
 verifies magic bytes before any of this runs.
 """
 
+import logging
 import os
 import re
 import stat
@@ -42,9 +49,18 @@ from roblox_studio_cli.errors import StudioMcpError, StudioRequestError
 from roblox_studio_cli.mcp_payloads import ToolImage
 from roblox_studio_cli.terminal import sanitize_single_line
 
+logger = logging.getLogger(__name__)
+
 UNSAFE_FILENAME_CHARACTER_PATTERN = re.compile(r"[^A-Za-z0-9_.-]")
 MAX_TOOL_NAME_CHARS_IN_FILENAME = 48
 IMAGE_FILE_PERMISSIONS = 0o600
+# Create or fail: O_EXCL is the guard against a path that appeared between the
+# check and the open, and O_NOFOLLOW against one that became a symlink.
+CREATE_EXCLUSIVELY_FLAGS = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+PARTIAL_FILE_SUFFIX = ".partial"
+# Said in two places on purpose: once by the check that runs before any target
+# is opened, once by the O_EXCL that catches a file created since that check.
+ALREADY_EXISTS_MESSAGE = "{path} already exists; pass --force to overwrite it"
 # A capture tool returns one image. Eight is room for a build that returns a
 # frame per data model, and still a bound on how many files one call can create.
 MAX_IMAGES_PER_RESULT = 8
@@ -95,15 +111,18 @@ def write_temporary_image_file(tool_name: str, file_extension: str, data: bytes)
         ) from write_error
 
 
-def write_image_bytes(path: Path, data: bytes, force: bool) -> None:
-    """Write `data` to `path`, refusing to follow a symlink or clobber by accident.
+def check_target_is_writable(path: Path, force: bool) -> None:
+    """Refuse a target the caller can fix, before anything at all is written.
+
+    Every target a result will use goes through this before the first one is
+    opened, so a blocked `-2` sibling cannot cost the caller the file they
+    named. Nothing here is the actual race guard: the checks are for the
+    message, and `O_EXCL` (or the rename) is what holds at the moment of truth.
 
     Raises:
         StudioRequestError: the path is a directory, a symlink or anything else
             that is not a regular file, is a second name for a file something
-            else also holds, already exists without `--force`, or cannot be
-            written. All caller-fixable, so they exit 2 rather than looking like
-            a Studio failure.
+            else also holds, or already exists without `--force`.
     """
     # Directory first: on macOS /tmp is itself a symlink, so the symlink check
     # would otherwise answer "--out /tmp" with a confusing message.
@@ -112,35 +131,89 @@ def write_image_bytes(path: Path, data: bytes, force: bool) -> None:
     if path.is_symlink():
         raise StudioRequestError(f"refusing to write through the symlink at {path}")
     existing = lstat_status(path)
-    if existing is not None and not stat.S_ISREG(existing.st_mode):
+    if existing is None:
+        return
+    if not stat.S_ISREG(existing.st_mode):
         raise StudioRequestError(
             f"{path} is not a regular file (a FIFO or device would block this process); "
             "--out takes a file path"
         )
-    # O_NOFOLLOW stops a symlink; a hard link is the same file under another
-    # name, and truncating it rewrites what every other name points at.
-    if existing is not None and existing.st_nlink > 1:
+    # A hard link is the same file under another name, and replacing it through
+    # one name would rewrite what every other name points at.
+    if existing.st_nlink > 1:
         raise StudioRequestError(
             f"{path} has {existing.st_nlink} hard links, so writing it would replace the "
             "contents of the other names too; point --out somewhere of its own"
         )
+    if not force:
+        raise StudioRequestError(ALREADY_EXISTS_MESSAGE.format(path=path))
 
-    flags = os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW
-    flags |= os.O_TRUNC if force else os.O_EXCL
-    try:
-        file_descriptor = os.open(path, flags, IMAGE_FILE_PERMISSIONS)
-    except FileExistsError as exists_error:
-        raise StudioRequestError(
-            f"{path} already exists; pass --force to overwrite it"
-        ) from exists_error
-    except OSError as open_error:
-        raise StudioRequestError(f"cannot write to {path}: {open_error}") from open_error
+
+def write_image_bytes(path: Path, data: bytes, force: bool) -> None:
+    """Put `data` at `path`, without clobbering anything the caller did not license.
+
+    Two ways in, and neither can leave a half-written file behind:
+
+    - Without `--force`, `O_CREAT | O_EXCL | O_NOFOLLOW` creates the file or
+      says it is already there. The fd is a brand new regular file by
+      construction, so nothing about the path needs re-checking.
+    - With `--force`, the bytes fill a temp file beside the target and are
+      renamed onto it. Rename is atomic and replaces the NAME rather than
+      following it, so a symlink planted after the check is replaced rather
+      than written through, and a write that fails partway (a full disk) leaves
+      the previous capture exactly as it was. The cost is that `--force` now
+      needs write permission on the DIRECTORY, which truncating in place did
+      not; a writable file in a read-only directory is the case that buys.
+
+    Raises:
+        StudioRequestError: the path exists without `--force`, or the write
+            failed. Caller-fixable either way, so they exit 2.
+    """
+    if not force:
+        try:
+            descriptor = os.open(path, CREATE_EXCLUSIVELY_FLAGS, IMAGE_FILE_PERMISSIONS)
+        except FileExistsError as exists_error:
+            raise StudioRequestError(ALREADY_EXISTS_MESSAGE.format(path=path)) from exists_error
+        except OSError as open_error:
+            raise StudioRequestError(f"cannot write to {path}: {open_error}") from open_error
+        fill_descriptor(descriptor, path, data)
+        return
 
     try:
-        with os.fdopen(file_descriptor, "wb") as image_file:
+        descriptor, temporary_name = tempfile.mkstemp(
+            dir=path.parent, prefix=f".{path.name}.", suffix=PARTIAL_FILE_SUFFIX
+        )
+    except OSError as temp_error:
+        raise StudioRequestError(f"cannot write to {path}: {temp_error}") from temp_error
+    temporary = Path(temporary_name)
+    fill_descriptor(descriptor, temporary, data)
+    try:
+        os.replace(temporary, path)
+    except OSError as replace_error:
+        remove_partial_file(temporary)
+        raise StudioRequestError(f"cannot write to {path}: {replace_error}") from replace_error
+
+
+def fill_descriptor(descriptor: int, path: Path, data: bytes) -> None:
+    """Write `data` through an open descriptor, taking the file back if it fails.
+
+    We created this file, so a half-written one is ours to remove: a disk that
+    fills up mid-capture used to leave a truncated PNG under the caller's name.
+    """
+    try:
+        with os.fdopen(descriptor, "wb") as image_file:
             image_file.write(data)
     except OSError as write_error:
+        remove_partial_file(path)
         raise StudioRequestError(f"cannot write to {path}: {write_error}") from write_error
+
+
+def remove_partial_file(path: Path) -> None:
+    """Delete a file this module created and could not finish, never anyone else's."""
+    try:
+        os.unlink(path)
+    except OSError as unlink_error:
+        logger.debug("could not remove the partial file at %s: %s", path, unlink_error)
 
 
 def lstat_status(path: Path) -> os.stat_result | None:
@@ -183,39 +256,50 @@ def save_images(
     says: the caller licensed one path, not a family of them. Without `--out`,
     each image gets its own temp file.
 
-    Every frame is decoded and signature-checked before any of them is written,
-    so a result whose second frame is a mislabelled payload leaves nothing
-    behind and does not spend the caller's single `--force` on a bad result.
+    Every frame is decoded and signature-checked, and every target is checked,
+    before any of them is written. A result whose second frame is a mislabelled
+    payload, or whose `-2` sibling is already on disk, leaves nothing behind and
+    does not spend the caller's single `--force` on a call that then fails.
 
     Raises:
         StudioMcpError: the result carried more images than one call may write,
             or a frame did not decode as the format it claimed. Nothing is
             written in either case, including the frames that were fine.
+        StudioRequestError: one of the targets is not writable as asked.
     """
     if len(images) > MAX_IMAGES_PER_RESULT:
         raise StudioMcpError(
             f"the tool returned {len(images)} images (limit {MAX_IMAGES_PER_RESULT}); "
-            "wrote none of them. Use --json to get the payload as-is."
+            "wrote none of them. Rerun with --json and no --out for the payload as sent."
         )
     payloads = [(image, image.decoded_bytes()) for image in images]
 
-    written: list[SavedImage] = []
-    for index, (image, data) in enumerate(payloads):
-        if out_path is None:
-            temporary = write_temporary_image_file(tool_name, image.file_extension(), data)
-            written.append(SavedImage(temporary))
-            continue
+    if out_path is None:
+        return [
+            SavedImage(write_temporary_image_file(tool_name, image.file_extension(), data))
+            for image, data in payloads
+        ]
 
-        is_the_requested_path = index == 0
-        path = (
-            out_path
-            if is_the_requested_path
-            else out_path.with_name(f"{out_path.stem}-{index + 1}{out_path.suffix}")
-        )
-        prepare_output_directory(path)
-        write_image_bytes(path, data, force=force and is_the_requested_path)
+    # Every sibling shares the named path's directory, so one mkdir covers them,
+    # and the checks below need that directory to exist to mean anything.
+    prepare_output_directory(out_path)
+    targets = [sibling_path(out_path, index) for index in range(len(payloads))]
+    for index, path in enumerate(targets):
+        # `--force` licenses the one path the caller named, never the siblings.
+        check_target_is_writable(path, force=force and index == 0)
+
+    written: list[SavedImage] = []
+    for index, (path, (image, data)) in enumerate(zip(targets, payloads)):
+        write_image_bytes(path, data, force=force and index == 0)
         written.append(SavedImage(path, extension_mismatch_warning(path, image)))
     return written
+
+
+def sibling_path(out_path: Path, index: int) -> Path:
+    """The path frame `index` lands on: the caller's own, then `-2`, `-3`."""
+    if index == 0:
+        return out_path
+    return out_path.with_name(f"{out_path.stem}-{index + 1}{out_path.suffix}")
 
 
 def prepare_output_directory(path: Path) -> None:

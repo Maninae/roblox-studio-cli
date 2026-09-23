@@ -7,12 +7,14 @@ result must not be able to scatter files across the caller's directory.
 """
 
 import base64
+import errno
 import os
 import tempfile
 from pathlib import Path
 
 import pytest
 
+from roblox_studio_cli import image_output as image_output_module
 from roblox_studio_cli.errors import StudioMcpError, StudioRequestError
 from roblox_studio_cli.image_output import (
     MAX_IMAGES_PER_RESULT,
@@ -21,6 +23,36 @@ from roblox_studio_cli.image_output import (
 )
 from roblox_studio_cli.mcp_payloads import ToolImage
 
+
+class FullDiskFile:
+    """A file object that creates nothing and fails the way a full disk fails.
+
+    The seam is `os.fdopen`, which is where both write paths (a fresh file and
+    the temp file a `--force` replacement fills) turn a descriptor into
+    something writable, so one fake covers both.
+    """
+
+    def __init__(self, descriptor: int):
+        """Hold the descriptor so closing it stays this object's job."""
+        self.descriptor = descriptor
+
+    def __enter__(self) -> "FullDiskFile":
+        return self
+
+    def __exit__(self, *details) -> bool:
+        os.close(self.descriptor)
+        return False
+
+    def write(self, data: bytes) -> int:
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+
+def full_disk_handle(descriptor: int, mode: str) -> FullDiskFile:
+    """Stand in for `os.fdopen`, keeping its signature."""
+    return FullDiskFile(descriptor)
+
+
+PREVIOUS_CAPTURE = b"\x89PNG\r\n\x1a\n" + b"the capture that was already there"
 PNG_BYTES = b"\x89PNG\r\n\x1a\n" + b"payload"
 PNG_IMAGE = ToolImage("image/png", base64.b64encode(PNG_BYTES).decode())
 JPEG_BYTES = b"\xff\xd8\xff" + b"payload"
@@ -100,7 +132,12 @@ def test_extra_frames_get_suffixes_instead_of_overwriting(tmp_path):
 
 
 def test_force_licenses_the_path_the_caller_named_and_not_its_siblings(tmp_path):
-    """The server decides how many frames come back; --force was about one file."""
+    """The server decides how many frames come back; --force was about one file.
+
+    All or nothing, like every other refusal here: the blocked sibling is found
+    before the first byte is written, so the call that reports failure has not
+    spent the caller's `--force` on the way to it.
+    """
     target = tmp_path / "shot.png"
     target.write_text("stale")
     sibling = tmp_path / "shot-2.png"
@@ -108,8 +145,49 @@ def test_force_licenses_the_path_the_caller_named_and_not_its_siblings(tmp_path)
 
     with pytest.raises(StudioRequestError, match="already exists"):
         save_images([PNG_IMAGE, PNG_IMAGE], "screen_capture", target, force=True)
-    assert target.read_bytes() == PNG_BYTES, "the named path should still be overwritten"
+    assert target.read_text() == "stale", "the named path was overwritten for a call that failed"
     assert sibling.read_text() == "precious", "--force reached a file the caller never named"
+
+
+@pytest.mark.parametrize(
+    "label, blocked",
+    [
+        ("a symlink at the sibling", "symlink"),
+        ("a directory at the sibling", "directory"),
+    ],
+)
+def test_any_unwritable_sibling_stops_the_call_before_the_first_write(tmp_path, label, blocked):
+    """Every target is checked before any of them is opened, not one at a time."""
+    target = tmp_path / "shot.png"
+    sibling = tmp_path / "shot-2.png"
+    if blocked == "symlink":
+        sibling.symlink_to(tmp_path / "victim.txt")
+    else:
+        sibling.mkdir()
+
+    with pytest.raises(StudioRequestError):
+        save_images([PNG_IMAGE, PNG_IMAGE], "screen_capture", target, force=True)
+    assert not target.exists(), f"{label} was found only after the first frame was written"
+
+
+def test_a_write_that_fails_leaves_no_half_written_file(tmp_path, monkeypatch):
+    """A full disk creates the file, then fails: the caller must not keep the stub."""
+    monkeypatch.setattr(image_output_module.os, "fdopen", full_disk_handle)
+    target = tmp_path / "shot.png"
+    with pytest.raises(StudioRequestError, match="cannot write"):
+        save_images([PNG_IMAGE], "screen_capture", target, force=False)
+    assert list(tmp_path.iterdir()) == [], "a zero-byte capture was left behind"
+
+
+def test_a_failed_overwrite_leaves_the_previous_capture_in_place(tmp_path, monkeypatch):
+    """`--force` licenses a replacement, not the destruction of what was there."""
+    monkeypatch.setattr(image_output_module.os, "fdopen", full_disk_handle)
+    target = tmp_path / "shot.png"
+    target.write_bytes(PREVIOUS_CAPTURE)
+    with pytest.raises(StudioRequestError, match="cannot write"):
+        save_images([PNG_IMAGE], "screen_capture", target, force=True)
+    assert target.read_bytes() == PREVIOUS_CAPTURE, "the old capture was truncated first"
+    assert list(tmp_path.iterdir()) == [target], "a partial file was left in the directory"
 
 
 def test_too_many_images_is_refused_with_nothing_written(tmp_path):
