@@ -97,6 +97,6 @@ class StudioMcpProtocolError(StudioMcpError):
 class StudioRequestError(StudioMcpError):
     """The caller's request is malformed, so the CLI exits 2 rather than 1.
 
-    Subclassed by `discovery.ToolDiscoveryError`; raised directly for file and
-    argument problems that never reach the bridge.
+    Subclassed by `tool_discovery.ToolDiscoveryError`; raised directly for file
+    and argument problems that never reach the bridge.
     """

@@ -216,6 +216,19 @@ def declared_arguments(tool: ToolDefinition) -> str:
     return ", ".join(capped_display_names(tool.argument_names)) or "none"
 
 
+def missing_argument_message(tool: ToolDefinition, wanted: str) -> str:
+    """Say that a discovered tool declares nothing that can carry a value we need.
+
+    Both halves are the server's: the name is capped like every other identifier
+    printed as chrome, and the declared list is capped in count, because the
+    sentence that matters is the one naming what is missing.
+    """
+    return (
+        f"tool {sanitize_diagnostic_line(tool.name)!r} has no {wanted} "
+        f"(declared: {declared_arguments(tool)})"
+    )
+
+
 def generate_capture_id() -> str:
     """A fresh id for one screen capture, unique enough for back-to-back calls."""
     return f"roblox-studio-{uuid.uuid4().hex[:CAPTURE_ID_RANDOM_CHARS]}"
@@ -380,8 +393,7 @@ def luau(
         )
         if code_argument is None:
             raise ToolDiscoveryError(
-                f"tool {sanitize_single_line(match.tool.name)!r} has no argument that looks "
-                f"like Luau source (declared: {declared_arguments(match.tool)})"
+                missing_argument_message(match.tool, "argument that looks like Luau source")
             )
         arguments: dict = {code_argument: source}
 
@@ -494,10 +506,7 @@ def play(
             match.tool, PLAY_START_ARGUMENT_NAMES, fall_back_to_required=False
         )
         if start_argument is None:
-            raise ToolDiscoveryError(
-                f"tool {sanitize_single_line(match.tool.name)!r} has no start/stop argument "
-                f"(declared: {declared_arguments(match.tool)})"
-            )
+            raise ToolDiscoveryError(missing_argument_message(match.tool, "start/stop argument"))
         arguments.setdefault(start_argument, start)
         result = call_discovered_tool(client, definitions, match.tool, arguments, studio, timeout)
 

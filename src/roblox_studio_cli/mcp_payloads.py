@@ -25,7 +25,11 @@ from roblox_studio_cli.errors import (
     StudioMcpError,
     StudioMcpProtocolError,
 )
-from roblox_studio_cli.terminal import sanitize_terminal_text, truncate_display_text
+from roblox_studio_cli.terminal import (
+    sanitize_diagnostic_line,
+    sanitize_terminal_text,
+    truncate_display_text,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -138,7 +142,7 @@ class ToolImage:
         extension = IMAGE_MIME_TYPE_TO_FILE_EXTENSION.get(declared)
         if extension is None:
             known = ", ".join(sorted(IMAGE_MIME_TYPE_TO_FILE_EXTENSION))
-            described = declared or "(none declared)"
+            described = sanitize_diagnostic_line(declared) or "(none declared)"
             raise StudioMcpError(
                 f"tool returned image content of unsupported type {described!r}. "
                 f"Known types: {known}. Rerun with --json and no --out for the payload "

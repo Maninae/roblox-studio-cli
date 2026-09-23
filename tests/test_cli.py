@@ -34,6 +34,7 @@ from roblox_studio_cli.main import (
     EXIT_REQUEST_ERROR,
     app,
 )
+from roblox_studio_cli.mcp_payloads import ToolDefinition
 from roblox_studio_cli.terminal import MAX_DIAGNOSTIC_TEXT_CHARS
 
 FAKE_SERVER_PATH = Path(__file__).resolve().parent / "fake_studio_mcp_server.py"
@@ -831,3 +832,18 @@ def test_an_unreadable_out_path_is_answered_by_the_code_that_writes_it(tmp_path)
     assert forced.exit_code == EXIT_OK, all_output(forced)
     target.chmod(0o600)
     assert target.read_bytes().startswith(PNG_MAGIC_BYTES)
+
+
+def test_a_tool_name_in_a_missing_argument_message_is_capped():
+    """The name is chrome in front of the sentence naming what the tool lacks.
+
+    Every other server-chosen identifier prints capped, and this one did not, so
+    a build that names a tool in 100 KB pushed the words the caller needs off
+    the screen. The declared list is capped in count by `declared_arguments`.
+    """
+    giant = ToolDefinition(name="t" * 500_000, description="", input_schema={})
+
+    message = main_module.missing_argument_message(giant, "start/stop argument")
+
+    assert len(message) < MAX_DIAGNOSTIC_TEXT_CHARS * 2, len(message)
+    assert "start/stop argument" in message

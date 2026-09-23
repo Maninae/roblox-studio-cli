@@ -16,7 +16,8 @@ says so; see its docstring.
 Design notes worth knowing before editing:
 
 - Tool names and argument keys are NEVER hardcoded. Roblox iterates on this
-  surface; callers discover both from `tools/list` at runtime (see `discovery`).
+  surface; callers discover both from `tools/list` at runtime (see
+  `tool_discovery` for which tool, `instance_discovery` for which Studio).
 - stdout is read from the raw fd with `select` and an explicit deadline, never
   via `readline()` on a buffered stream: a buffered reader can swallow a second
   message into Python's own buffer, after which `select` reports "not ready" and

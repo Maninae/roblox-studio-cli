@@ -303,3 +303,20 @@ def test_a_giant_rpc_error_message_is_capped(envelope):
         raise_for_rpc_error(envelope)
     assert len(raised.value.rpc_message) == MAX_DIAGNOSTIC_TEXT_CHARS
     assert raised.value.rpc_message.endswith("...")
+
+
+def test_an_unsupported_mime_type_is_capped_before_it_is_quoted():
+    """The type a tool declared is server-chosen text, and this error quotes it back.
+
+    Unlike the MIME type in the extension warning next door, this one is the
+    UNRECOGNISED type, so its length is whatever the server felt like: 500 KB of
+    it buried the advice under the quote, which is the line telling the caller
+    how to get their payload anyway.
+    """
+    giant = ToolImage(mime_type="image/" + "x" * 500_000, data_base64="")
+
+    with pytest.raises(StudioMcpError) as raised:
+        giant.file_extension()
+
+    assert len(str(raised.value)) < MAX_DIAGNOSTIC_TEXT_CHARS * 3, len(str(raised.value))
+    assert "--json and no --out" in str(raised.value)
