@@ -22,6 +22,11 @@ wheels/
 .installed.cfg
 *.egg
 
+# Lockfiles. Nothing here installs from one: CI and the README both use pip
+# against pyproject, whose test extra is pinned exactly, so a committed lock
+# guards nothing and goes stale unwatched. Keep it local if you use uv.
+uv.lock
+
 # Virtual environments
 venv/
 .venv/
