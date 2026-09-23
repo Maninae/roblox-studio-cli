@@ -151,6 +151,9 @@ def test_a_never_attaching_studio_quotes_what_the_bridge_said():
     output = all_output(result)
     assert "No Roblox Studio instance attached" in output
     assert "Unable to reach Roblox Studio" in output, "the bridge's own words were dropped"
+    # The wait is the smaller of the attach window and --timeout, and the
+    # message has to name the one that elapsed: this run waited a second.
+    assert f"within {SHORT_TIMEOUT} s" in output, "the advice named a window nobody waited"
 
 
 def test_tools_lists_names_and_required_arguments():

@@ -40,7 +40,11 @@ import time
 from dataclasses import dataclass, field
 
 from roblox_studio_cli.client import DEFAULT_CALL_TOOL_TIMEOUT_SECONDS, StudioMcpClient
-from roblox_studio_cli.errors import StudioNotAttachedError, StudioRequestError
+from roblox_studio_cli.errors import (
+    StudioMcpTimeoutError,
+    StudioNotAttachedError,
+    StudioRequestError,
+)
 from roblox_studio_cli.mcp_payloads import ToolDefinition
 from roblox_studio_cli.terminal import (
     MAX_ENUMERATED_NAMES,
@@ -70,14 +74,6 @@ STUDIO_INSTANCE_LIST_KEYS = ("studios", "instances", "roblox_studios")
 # then. Earlier runs attached in 1.1 s and once took about 10 s.
 STUDIO_ATTACH_TIMEOUT_SECONDS = 12.0
 STUDIO_ATTACH_POLL_INTERVAL_SECONDS = 0.5
-
-NO_STUDIO_INSTANCE_MESSAGE = (
-    f"No Roblox Studio instance attached within {STUDIO_ATTACH_TIMEOUT_SECONDS:.0f} s. "
-    "Studio attaches to a client a few seconds after it connects; check that a place is "
-    'open and "Enable Studio as MCP server" is on (Assistant settings > MCP Servers). '
-    'Studio\'s dialog shows "No clients connected" until a command is running; '
-    "that is normal."
-)
 
 TOOL_NAME_TOKEN_PATTERN = re.compile(r"[A-Z]+(?![a-z])|[A-Z][a-z0-9]*|[a-z0-9]+")
 
@@ -161,6 +157,8 @@ class StudioAttachOutcome:
     instances: list[StudioInstance] = field(default_factory=list)
     elapsed_seconds: float = 0.0
     last_error_text: str = ""
+    # What the failure message quotes: `--timeout` when it is the shorter one.
+    window_seconds: float = STUDIO_ATTACH_TIMEOUT_SECONDS
 
     @property
     def attached(self) -> bool:
@@ -447,26 +445,57 @@ def wait_for_studio_instances(
     commands, and instance ids do not survive a Studio restart.
     """
     lister = find_tool(tools, LIST_INSTANCES_INTENT).tool
+    # The smaller of the two bounds is the one every poll and every message obeys.
+    window = max(min(attach_timeout, timeout), 0.0)
     started = time.monotonic()
-    deadline = started + max(min(attach_timeout, timeout), 0.0)
+    deadline = started + window
     last_error_text = ""
 
     while True:
-        result = client.call_tool(lister.name, {}, timeout=timeout)
-        if result.is_error:
-            last_error_text = result.text
+        # What is left of the window, never the whole `--timeout`: given that, a
+        # poll starting just inside a 12 s window could run another 120.
+        remaining = max(deadline - time.monotonic(), 0.0)
+        try:
+            result = client.call_tool(lister.name, {}, timeout=remaining)
+        except StudioMcpTimeoutError:
+            # The poll held the rest of the window, so the window is gone, and
+            # "nothing attached in time" is what the check below already says.
+            logger.debug("the instance lister did not answer inside the attach window")
         else:
-            last_error_text = ""
-            instances = parse_studio_instances(result.text)
-            if instances:
-                return StudioAttachOutcome(instances, time.monotonic() - started)
+            if result.is_error:
+                last_error_text = result.text
+            else:
+                last_error_text = ""
+                instances = parse_studio_instances(result.text)
+                if instances:
+                    return StudioAttachOutcome(
+                        instances, time.monotonic() - started, window_seconds=window
+                    )
 
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             return StudioAttachOutcome(
-                elapsed_seconds=time.monotonic() - started, last_error_text=last_error_text
+                elapsed_seconds=time.monotonic() - started,
+                last_error_text=last_error_text,
+                window_seconds=window,
             )
         time.sleep(min(STUDIO_ATTACH_POLL_INTERVAL_SECONDS, remaining))
+
+
+def no_studio_instance_message(window_seconds: float) -> str:
+    """The "no Studio attached" advice, naming the window that actually elapsed.
+
+    That number is a fact about this run, not the default: `--timeout 1` waits
+    one second, and saying twelve sends the reader hunting for eleven that
+    never happened.
+    """
+    return (
+        f"No Roblox Studio instance attached within {window_seconds:g} s. "
+        "Studio attaches to a client a few seconds after it connects; check that a place is "
+        'open and "Enable Studio as MCP server" is on (Assistant settings > MCP Servers). '
+        'Studio\'s dialog shows "No clients connected" until a command is running; '
+        "that is normal."
+    )
 
 
 def attach_failure_message(outcome: StudioAttachOutcome) -> str:
@@ -476,10 +505,11 @@ def attach_failure_message(outcome: StudioAttachOutcome) -> str:
     but it is capped: it is a diagnostic aside under the advice that matters, and
     a server that answers with a megabyte would otherwise push the advice away.
     """
+    advice = no_studio_instance_message(outcome.window_seconds)
     if not outcome.last_error_text:
-        return NO_STUDIO_INSTANCE_MESSAGE
+        return advice
     quoted = truncate_display_text(sanitize_terminal_text(outcome.last_error_text.strip()))
-    return f"{NO_STUDIO_INSTANCE_MESSAGE}\nThe bridge last answered: {quoted}"
+    return f"{advice}\nThe bridge last answered: {quoted}"
 
 
 def resolve_studio_id(

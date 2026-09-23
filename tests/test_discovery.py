@@ -22,9 +22,10 @@ from roblox_studio_cli.discovery import (
     LIST_INSTANCES_INTENT,
     LUAU_CODE_ARGUMENT_NAMES,
     LUAU_INTENT,
-    NO_STUDIO_INSTANCE_MESSAGE,
     PLAY_INTENT,
     SCREENSHOT_INTENT,
+    STUDIO_ATTACH_POLL_INTERVAL_SECONDS,
+    STUDIO_ATTACH_TIMEOUT_SECONDS,
     STUDIO_STATE_INTENT,
     StudioAttachOutcome,
     StudioInstance,
@@ -36,14 +37,21 @@ from roblox_studio_cli.discovery import (
     find_argument_name,
     find_tool,
     match_requested_instance,
+    no_studio_instance_message,
     parse_arguments_option,
     parse_studio_instances,
     tool_name_tokens,
+    wait_for_studio_instances,
 )
-from roblox_studio_cli.mcp_payloads import ToolDefinition
+from roblox_studio_cli.errors import StudioMcpTimeoutError
+from roblox_studio_cli.mcp_payloads import ToolCallResult, ToolDefinition
 from roblox_studio_cli.terminal import MAX_DIAGNOSTIC_TEXT_CHARS
 
 STRING = {"type": "string"}
+# A caller's timeout far longer than the attach window, so the two cannot be
+# confused for each other, and a window short enough to spend in a test.
+GENEROUS_CALL_TIMEOUT_SECONDS = 120.0
+SHORT_ATTACH_WINDOW_SECONDS = 1.0
 
 
 def build_tool(name: str, properties: dict, required: list[str] | None = None) -> ToolDefinition:
@@ -373,5 +381,89 @@ def test_the_quoted_bridge_error_is_capped():
     """The attach advice quotes whatever the lister last said, which can be anything."""
     outcome = StudioAttachOutcome(last_error_text="e" * 500_000)
     message = attach_failure_message(outcome)
+    advice = no_studio_instance_message(outcome.window_seconds)
     assert "The bridge last answered:" in message
-    assert len(message) < len(NO_STUDIO_INSTANCE_MESSAGE) + MAX_DIAGNOSTIC_TEXT_CHARS + 40
+    assert len(message) < len(advice) + MAX_DIAGNOSTIC_TEXT_CHARS + 40
+
+
+class NeverAttachingClient:
+    """A lister that answers promptly and always says no Studio is registered.
+
+    Records the timeout each poll was given, which is the thing under test: a
+    poll is entitled to what is left of the attach window, not to the caller's
+    whole `--timeout`.
+    """
+
+    def __init__(self, failure: Exception | None = None):
+        self.poll_timeouts: list[float] = []
+        self.failure = failure
+
+    def call_tool(self, name: str, arguments: dict, timeout: float) -> ToolCallResult:
+        self.poll_timeouts.append(timeout)
+        if self.failure is not None:
+            raise self.failure
+        return ToolCallResult(is_error=True, text="Unable to reach Roblox Studio")
+
+
+LISTER_TOOLS = [build_tool("list_roblox_studios", {})]
+
+
+def test_the_attach_message_names_the_window_that_was_actually_waited():
+    """`--timeout 1` waits one second, and used to report twelve.
+
+    The window is the smaller of the attach window and the caller's timeout, so
+    the number in the message is a fact about this run. Naming the default sent
+    the reader looking for eleven seconds that never happened.
+    """
+    outcome = StudioAttachOutcome(window_seconds=SHORT_ATTACH_WINDOW_SECONDS)
+
+    message = attach_failure_message(outcome)
+
+    assert "within 1 s" in message
+    assert f"{STUDIO_ATTACH_TIMEOUT_SECONDS:g} s" not in message
+
+
+def test_no_poll_may_outlive_the_window_it_shares():
+    """A poll given the whole `--timeout` can run past the window it was bounded by.
+
+    The wait promises the smaller of the two, but each poll used to carry the
+    caller's timeout, so a poll starting just inside a 12 s window could run
+    another 120, and a command that promised 12 s took over two minutes.
+    """
+    client = NeverAttachingClient()
+
+    outcome = wait_for_studio_instances(
+        client,
+        LISTER_TOOLS,
+        timeout=GENEROUS_CALL_TIMEOUT_SECONDS,
+        attach_timeout=SHORT_ATTACH_WINDOW_SECONDS,
+    )
+
+    assert not outcome.attached
+    assert outcome.window_seconds == SHORT_ATTACH_WINDOW_SECONDS
+    assert client.poll_timeouts, "the lister was never polled"
+    assert max(client.poll_timeouts) <= SHORT_ATTACH_WINDOW_SECONDS, client.poll_timeouts
+    assert client.poll_timeouts == sorted(client.poll_timeouts, reverse=True), (
+        "each poll should get what is left of the window, so the budgets shrink"
+    )
+
+
+def test_a_lister_that_never_answers_is_nothing_attached_rather_than_a_transport_error():
+    """A poll bounded by the window can only time out once the window is gone.
+
+    Which is the outcome this function exists to report, so it reports it: the
+    caller gets the "no Studio attached" advice, not a timeout naming a fraction
+    of a second nobody asked for.
+    """
+    client = NeverAttachingClient(failure=StudioMcpTimeoutError("no response to 'tools/call'"))
+
+    outcome = wait_for_studio_instances(
+        client,
+        LISTER_TOOLS,
+        timeout=GENEROUS_CALL_TIMEOUT_SECONDS,
+        attach_timeout=SHORT_ATTACH_WINDOW_SECONDS,
+    )
+
+    assert not outcome.attached
+    spent = SHORT_ATTACH_WINDOW_SECONDS - STUDIO_ATTACH_POLL_INTERVAL_SECONDS
+    assert outcome.elapsed_seconds >= spent, "it gave up before the window was gone"
