@@ -1,4 +1,4 @@
-"""Unit tests for runtime discovery: tool matching, argument matching, instance parsing.
+"""Unit tests for tool discovery: which tool an intent matches, and on which argument.
 
 These are pure functions over a `tools/list` payload, so they need neither a
 subprocess nor Roblox. They pin the two behaviours that matter: intent maps onto
@@ -17,42 +17,27 @@ would act on a live place, so each gets a test.
 
 import pytest
 
-from roblox_studio_cli.discovery import (
+from roblox_studio_cli.mcp_payloads import ToolDefinition
+from roblox_studio_cli.terminal import MAX_DIAGNOSTIC_TEXT_CHARS
+from roblox_studio_cli.tool_discovery import (
     DESTRUCTIVE_NAME_TOKENS,
     LIST_INSTANCES_INTENT,
     LUAU_CODE_ARGUMENT_NAMES,
     LUAU_INTENT,
     PLAY_INTENT,
     SCREENSHOT_INTENT,
-    STUDIO_ATTACH_POLL_INTERVAL_SECONDS,
-    STUDIO_ATTACH_TIMEOUT_SECONDS,
     STUDIO_STATE_INTENT,
-    StudioAttachOutcome,
-    StudioInstance,
     ToolDiscoveryError,
     ToolIntent,
-    attach_failure_message,
     check_required_arguments,
     destructive_tokens_in,
     find_argument_name,
     find_tool,
-    match_requested_instance,
-    no_studio_instance_message,
     parse_arguments_option,
-    parse_studio_instances,
     tool_name_tokens,
-    wait_for_studio_instances,
 )
-from roblox_studio_cli.errors import StudioMcpTimeoutError
-from roblox_studio_cli.mcp_payloads import ToolCallResult, ToolDefinition
-from roblox_studio_cli.terminal import MAX_DIAGNOSTIC_TEXT_CHARS
 
 STRING = {"type": "string"}
-# A caller's timeout far longer than the attach window, so the two cannot be
-# confused for each other, and a window short enough to spend in a test.
-GENEROUS_CALL_TIMEOUT_SECONDS = 120.0
-SHORT_ATTACH_WINDOW_SECONDS = 1.0
-
 
 def build_tool(name: str, properties: dict, required: list[str] | None = None) -> ToolDefinition:
     """A ToolDefinition with the JSON Schema shape the real server sends."""
@@ -290,180 +275,3 @@ def test_parse_arguments_option_rejects_non_objects():
         parse_arguments_option("{not json}")
     with pytest.raises(ToolDiscoveryError, match="JSON object"):
         parse_arguments_option("[1, 2]")
-
-
-def test_parse_studio_instances_reads_the_bridge_payload():
-    instances = parse_studio_instances('{"studios": [{"id": "studio-1", "name": "Baseplate"}]}')
-    assert [(item.identifier, item.name) for item in instances] == [("studio-1", "Baseplate")]
-    assert instances[0].describe() == "studio-1 (Baseplate)"
-
-
-def test_parse_studio_instances_handles_the_empty_and_broken_cases():
-    """An empty place list and unparseable output both mean "nothing registered"."""
-    assert parse_studio_instances('{"studios": []}') == []
-    assert parse_studio_instances("") == []
-    assert parse_studio_instances("not json at all") == []
-    assert parse_studio_instances('{"unexpected": 1}') == []
-
-
-def test_parse_studio_instances_accepts_alternative_spellings_and_a_missing_name():
-    """A live bridge has been seen returning an entry with no `name` at all."""
-    instances = parse_studio_instances(
-        '[{"studio_id": "a", "place_name": "P"}, "bare-id", {"id": "c"}]'
-    )
-    assert [item.identifier for item in instances] == ["a", "bare-id", "c"]
-    assert instances[1].describe() == "bare-id"
-    assert instances[2].describe() == "c"
-
-
-def test_instance_names_cannot_carry_escape_sequences_into_the_terminal():
-    hostile = StudioInstance(identifier="studio-1", name="Place\x1b]0;pwned\x07")
-    assert hostile.describe() == "studio-1 (Place)"
-
-
-def test_requested_instance_matches_id_then_name_then_substring():
-    instances = [
-        StudioInstance("studio-1", "Baseplate"),
-        StudioInstance("studio-2", "Obby Tower"),
-    ]
-    assert match_requested_instance(instances, "studio-2") == "studio-2"
-    assert match_requested_instance(instances, "baseplate") == "studio-1"
-    assert match_requested_instance(instances, "Obby") == "studio-2"
-
-
-def test_an_ambiguous_studio_name_is_an_error_not_a_first_hit():
-    instances = [
-        StudioInstance("studio-1", "Tower Defense"),
-        StudioInstance("studio-2", "Tower Defense copy"),
-    ]
-    with pytest.raises(ToolDiscoveryError, match="matches 2 instances"):
-        match_requested_instance(instances, "tower")
-
-
-def test_an_unknown_studio_is_rejected_with_the_known_list():
-    instances = [StudioInstance("studio-1", "Baseplate")]
-    with pytest.raises(ToolDiscoveryError, match="Registered: studio-1"):
-        match_requested_instance(instances, "nope")
-
-
-def test_the_registered_list_is_capped_in_count_as_well_as_per_row():
-    """Each row was already capped; the number of rows is the bridge's choice too."""
-    crowd = [StudioInstance(f"studio-{index}", f"Place{index}") for index in range(60)]
-    with pytest.raises(ToolDiscoveryError) as raised:
-        match_requested_instance(crowd, "nope")
-    message = str(raised.value)
-    assert "and 40 more" in message
-    assert "studio-59" not in message
-
-
-def test_instance_ids_are_sanitised_onto_one_line_as_well_as_names():
-    """A newline in an id would forge an extra entry in the list a caller chooses from."""
-    hostile = StudioInstance(identifier="studio-1\nstudio-2 (Fake)", name="Place‮eht")
-    assert hostile.describe() == "studio-1 studio-2 (Fake) (Placeeht)"
-    assert "\n" not in hostile.describe()
-
-
-def test_a_giant_instance_name_is_capped_before_it_is_printed():
-    """An instance name is chrome around an answer, and the bridge chooses its length."""
-    described = StudioInstance(identifier="studio-1", name="n" * 500_000).describe()
-    assert len(described) < MAX_DIAGNOSTIC_TEXT_CHARS * 2
-    assert described.startswith("studio-1 (nnn")
-    assert described.endswith("...)")
-
-
-def test_a_giant_instance_id_is_capped_too():
-    described = StudioInstance(identifier="i" * 500_000, name="").describe()
-    assert len(described) == MAX_DIAGNOSTIC_TEXT_CHARS
-    assert described.endswith("...")
-
-
-def test_the_quoted_bridge_error_is_capped():
-    """The attach advice quotes whatever the lister last said, which can be anything."""
-    outcome = StudioAttachOutcome(last_error_text="e" * 500_000)
-    message = attach_failure_message(outcome)
-    advice = no_studio_instance_message(outcome.window_seconds)
-    assert "The bridge last answered:" in message
-    assert len(message) < len(advice) + MAX_DIAGNOSTIC_TEXT_CHARS + 40
-
-
-class NeverAttachingClient:
-    """A lister that answers promptly and always says no Studio is registered.
-
-    Records the timeout each poll was given, which is the thing under test: a
-    poll is entitled to what is left of the attach window, not to the caller's
-    whole `--timeout`.
-    """
-
-    def __init__(self, failure: Exception | None = None):
-        self.poll_timeouts: list[float] = []
-        self.failure = failure
-
-    def call_tool(self, name: str, arguments: dict, timeout: float) -> ToolCallResult:
-        self.poll_timeouts.append(timeout)
-        if self.failure is not None:
-            raise self.failure
-        return ToolCallResult(is_error=True, text="Unable to reach Roblox Studio")
-
-
-LISTER_TOOLS = [build_tool("list_roblox_studios", {})]
-
-
-def test_the_attach_message_names_the_window_that_was_actually_waited():
-    """`--timeout 1` waits one second, and used to report twelve.
-
-    The window is the smaller of the attach window and the caller's timeout, so
-    the number in the message is a fact about this run. Naming the default sent
-    the reader looking for eleven seconds that never happened.
-    """
-    outcome = StudioAttachOutcome(window_seconds=SHORT_ATTACH_WINDOW_SECONDS)
-
-    message = attach_failure_message(outcome)
-
-    assert "within 1 s" in message
-    assert f"{STUDIO_ATTACH_TIMEOUT_SECONDS:g} s" not in message
-
-
-def test_no_poll_may_outlive_the_window_it_shares():
-    """A poll given the whole `--timeout` can run past the window it was bounded by.
-
-    The wait promises the smaller of the two, but each poll used to carry the
-    caller's timeout, so a poll starting just inside a 12 s window could run
-    another 120, and a command that promised 12 s took over two minutes.
-    """
-    client = NeverAttachingClient()
-
-    outcome = wait_for_studio_instances(
-        client,
-        LISTER_TOOLS,
-        timeout=GENEROUS_CALL_TIMEOUT_SECONDS,
-        attach_timeout=SHORT_ATTACH_WINDOW_SECONDS,
-    )
-
-    assert not outcome.attached
-    assert outcome.window_seconds == SHORT_ATTACH_WINDOW_SECONDS
-    assert client.poll_timeouts, "the lister was never polled"
-    assert max(client.poll_timeouts) <= SHORT_ATTACH_WINDOW_SECONDS, client.poll_timeouts
-    assert client.poll_timeouts == sorted(client.poll_timeouts, reverse=True), (
-        "each poll should get what is left of the window, so the budgets shrink"
-    )
-
-
-def test_a_lister_that_never_answers_is_nothing_attached_rather_than_a_transport_error():
-    """A poll bounded by the window can only time out once the window is gone.
-
-    Which is the outcome this function exists to report, so it reports it: the
-    caller gets the "no Studio attached" advice, not a timeout naming a fraction
-    of a second nobody asked for.
-    """
-    client = NeverAttachingClient(failure=StudioMcpTimeoutError("no response to 'tools/call'"))
-
-    outcome = wait_for_studio_instances(
-        client,
-        LISTER_TOOLS,
-        timeout=GENEROUS_CALL_TIMEOUT_SECONDS,
-        attach_timeout=SHORT_ATTACH_WINDOW_SECONDS,
-    )
-
-    assert not outcome.attached
-    spent = SHORT_ATTACH_WINDOW_SECONDS - STUDIO_ATTACH_POLL_INTERVAL_SECONDS
-    assert outcome.elapsed_seconds >= spent, "it gave up before the window was gone"

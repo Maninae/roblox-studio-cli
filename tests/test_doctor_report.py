@@ -6,8 +6,8 @@ not having attached (or no place open), and tools that arrive empty is a
 Studio-side fault that neither of those explains.
 """
 
-from roblox_studio_cli.discovery import StudioInstance
 from roblox_studio_cli.doctor_report import DoctorReport, doctor_verdict
+from roblox_studio_cli.instance_discovery import StudioInstance
 
 BINARY = "/Applications/RobloxStudio.app/Contents/MacOS/StudioMCP"
 

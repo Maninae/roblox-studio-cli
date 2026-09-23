@@ -11,9 +11,9 @@
     play        start or stop a play session
 
 Every tool-calling subcommand resolves three things at runtime rather than
-hardcoding them: the tool name, the argument keys, and which Studio instance to
-target. That lookup lives in `discovery`; this module is the command surface,
-the output, and the exit codes.
+hardcoding them: the tool name and its argument keys (`tool_discovery`), and
+which Studio instance to target (`instance_discovery`). This module is the
+command surface, the output, and the exit codes.
 
 Exit codes come from one rule, applied in `exit_code_for` and documented in
 `errors`: a malformed request exits 2, an environment that is not ready exits 1.
@@ -36,24 +36,6 @@ from roblox_studio_cli.client import (
     DEFAULT_LIST_TOOLS_TIMEOUT_SECONDS,
     StudioMcpClient,
 )
-from roblox_studio_cli.discovery import (
-    CAPTURE_ID_ARGUMENT_NAMES,
-    LUAU_CODE_ARGUMENT_NAMES,
-    LUAU_CONTEXT_ARGUMENT_NAMES,
-    LUAU_INTENT,
-    PLAY_INTENT,
-    PLAY_START_ARGUMENT_NAMES,
-    SCREENSHOT_INTENT,
-    STUDIO_STATE_INTENT,
-    ToolDiscoveryError,
-    apply_studio_id,
-    attach_failure_message,
-    check_required_arguments,
-    find_argument_name,
-    find_tool,
-    parse_arguments_option,
-    wait_for_studio_instances,
-)
 from roblox_studio_cli.display_wake import DISPLAY_ASLEEP_HINT, display_kept_awake
 from roblox_studio_cli.doctor_report import gather_doctor_report, render_doctor_report
 from roblox_studio_cli.errors import (
@@ -64,6 +46,11 @@ from roblox_studio_cli.errors import (
     StudioRequestError,
 )
 from roblox_studio_cli.image_output import save_images
+from roblox_studio_cli.instance_discovery import (
+    apply_studio_id,
+    attach_failure_message,
+    wait_for_studio_instances,
+)
 from roblox_studio_cli.json_output import compact_json
 from roblox_studio_cli.luau_source import read_luau_source
 from roblox_studio_cli.mcp_payloads import ToolCallResult, ToolDefinition
@@ -72,6 +59,21 @@ from roblox_studio_cli.terminal import (
     echo_server_text,
     sanitize_diagnostic_line,
     sanitize_single_line,
+)
+from roblox_studio_cli.tool_discovery import (
+    CAPTURE_ID_ARGUMENT_NAMES,
+    LUAU_CODE_ARGUMENT_NAMES,
+    LUAU_CONTEXT_ARGUMENT_NAMES,
+    LUAU_INTENT,
+    PLAY_INTENT,
+    PLAY_START_ARGUMENT_NAMES,
+    SCREENSHOT_INTENT,
+    STUDIO_STATE_INTENT,
+    ToolDiscoveryError,
+    check_required_arguments,
+    find_argument_name,
+    find_tool,
+    parse_arguments_option,
 )
 
 EXIT_OK = 0

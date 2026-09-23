@@ -26,12 +26,12 @@ from roblox_studio_cli.client import (
     StudioMcpClient,
     resolve_studio_binary_path,
 )
-from roblox_studio_cli.discovery import (
+from roblox_studio_cli.errors import StudioMcpError, StudioNotConnectedError
+from roblox_studio_cli.instance_discovery import (
     StudioInstance,
     attach_failure_message,
     wait_for_studio_instances,
 )
-from roblox_studio_cli.errors import StudioMcpError, StudioNotConnectedError
 from roblox_studio_cli.json_output import compact_json
 from roblox_studio_cli.terminal import (
     echo_server_text,
