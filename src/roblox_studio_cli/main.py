@@ -135,10 +135,16 @@ def validate_timeout_seconds(value: float) -> float:
 # where every other refusal about this path is decided and worded.
 OUT_PATH_IS_NOT_READ = False
 
+# "the result" was six commands' worth of a promise this flag does not make.
+# It bounds the handshake and `tools/list` as well, and the attach poll, so a
+# reader who sized it for the tool call alone sized four waits by accident.
 CALL_TIMEOUT_OPTION = typer.Option(
     DEFAULT_CALL_TOOL_TIMEOUT_SECONDS,
     "--timeout",
-    help="Seconds to wait for the result.",
+    help=(
+        "Seconds bounding every exchange with the bridge (handshake, tool list, "
+        "the call) and the wait for Studio to attach."
+    ),
     callback=validate_timeout_seconds,
 )
 FORCE_OPTION = typer.Option(False, "--force", help="Overwrite the --out file if it exists.")

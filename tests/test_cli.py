@@ -183,6 +183,21 @@ def test_a_never_attaching_studio_quotes_what_the_bridge_said():
     assert f"within {SHORT_TIMEOUT} s" in output, "the advice named a window nobody waited"
 
 
+def test_the_timeout_help_names_every_wait_it_bounds():
+    """The flag bounds four waits and its help line promised one, on six commands.
+
+    "Seconds to wait for the result" reads as a bound on the tool call, so a
+    caller sizing it for a slow script sized the handshake, the tool listing
+    and the attach poll by accident, all of which it also shortens. The README
+    has said so for as long as that has been true.
+    """
+    for command in ("instances", "luau", "call", "state", "play", "screenshot"):
+        help_text = all_output(invoke([command, "--help"]))
+        assert "Seconds to wait for the result" not in help_text, command
+        for named_wait in ("handshake", "tool list", "attach"):
+            assert named_wait in help_text, (command, named_wait)
+
+
 def test_tools_lists_names_and_required_arguments():
     result = invoke(["tools"])
     assert result.exit_code == EXIT_OK, all_output(result)
