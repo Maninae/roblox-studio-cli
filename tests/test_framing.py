@@ -469,11 +469,14 @@ def test_nesting_up_to_the_cap_is_still_parsed():
 
 
 def test_braces_inside_tool_output_are_not_structure():
-    """The depth scan blanks string literals first, so Luau source cannot trip it.
+    """The depth scan reads strings the way JSON does, so Luau source cannot trip it.
 
-    A tool result holding a thousand braces (a minified table, an escaped
-    quote next to one) is an ordinary answer, and counting raw bytes would
-    have refused it.
+    A tool result holding a thousand braces (a minified table, an escaped quote
+    next to one) is an ordinary answer: every one of them arrives while the walk
+    is inside a string literal, so none of them is structure. Counting raw bytes
+    would have refused the frame. The scan used to blank the string literals with
+    a regex before counting, which reached the same verdict and backtracked
+    quadratically to get there; it now tracks quote and escape state as it walks.
     """
     source = '{' * (MAX_FRAME_CONTAINER_DEPTH * 2) + '\\" }'
     frame = json.dumps({"id": 1, "result": {"content": source}}).encode("utf-8")
