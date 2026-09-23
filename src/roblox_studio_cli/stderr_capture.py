@@ -117,13 +117,22 @@ class ProxyStderrCapture:
         return "\n".join(lines[-max_lines:])
 
     def stderr_suffix(self) -> str:
-        """Recent stderr, sanitised and capped per line, for appending to an exception.
+        r"""Recent stderr, sanitised and capped per line, for appending to an exception.
 
         Each quoted line is diagnostic chrome whose length the proxy chose, and
         `STDERR_MAX_LINE_BYTES` lets a 64 KB one into the ring buffer, so six of
         them used to mean 384 KB under a one-line message.
+
+        The cap is per ENTRY, so the entries are what gets capped: joining them
+        and re-splitting the text went through `str.splitlines`, which breaks on
+        a carriage return (and on \x0b, \x0c, \x1c-\x1e, \x85 and the two
+        Unicode separators) as well as on a newline. One 64 KB entry of "x\r"
+        became 32,000 two-character lines that way, every one of them inside the
+        200-character cap, and `tools --timeout 1` printed 384,062 bytes.
         """
-        quoted = [sanitize_diagnostic_line(line) for line in self.recent_stderr().splitlines()]
+        with self.stderr_lock:
+            recent = list(self.stderr_lines)[-STDERR_QUOTE_LINES:]
+        quoted = [sanitize_diagnostic_line(entry) for entry in recent]
         stderr_text = "\n".join(line for line in quoted if line)
         return f"\nProxy stderr:\n{stderr_text}" if stderr_text else ""
 
