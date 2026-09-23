@@ -158,7 +158,11 @@ class ToolImage:
 
         Raises:
             StudioMcpError: undecodable base64, an unknown MIME type, or a
-                payload whose magic bytes do not match the declared type.
+                payload whose magic bytes do not match the declared type. The
+                type is quoted back capped, not raw: `file_extension` strips
+                and folds it before the lookup, so a recognised type padded
+                with two million spaces gets here intact and printed every
+                byte of itself on stderr.
         """
         extension = self.file_extension()
         compact = "".join(self.data_base64.split())
@@ -171,8 +175,9 @@ class ToolImage:
 
         for offset, signature in IMAGE_SIGNATURES_BY_FILE_EXTENSION[extension]:
             if data[offset : offset + len(signature)] != signature:
+                declared_type = sanitize_diagnostic_line(self.mime_type)
                 raise StudioMcpError(
-                    f"tool declared {self.mime_type!r} but the payload is not a "
+                    f"tool declared {declared_type!r} but the payload is not a "
                     f"{extension.lstrip('.')} file (signature mismatch); refusing to write it."
                 )
         return data

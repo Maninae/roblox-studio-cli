@@ -34,6 +34,9 @@ from roblox_studio_cli.terminal import MAX_DIAGNOSTIC_TEXT_CHARS
 
 PNG_BYTES = b"\x89PNG\r\n\x1a\n" + b"payload"
 PNG_BASE64 = base64.b64encode(PNG_BYTES).decode()
+# Padding wide enough that quoting it raw is unmistakable in a terminal, and
+# small enough to build in a test: the measured leak was 2,000,103 characters.
+PADDED_MIME_TYPE_SPACES = 2_000_000
 
 
 def test_tool_definition_tolerates_a_junk_schema():
@@ -303,6 +306,29 @@ def test_a_giant_rpc_error_message_is_capped(envelope):
         raise_for_rpc_error(envelope)
     assert len(raised.value.rpc_message) == MAX_DIAGNOSTIC_TEXT_CHARS
     assert raised.value.rpc_message.endswith("...")
+
+
+def test_a_padded_mime_type_is_capped_on_the_signature_mismatch_path_too():
+    """The type that reaches the mismatch is RECOGNISED, and still server-sized.
+
+    `file_extension` strips and folds the declared type before looking it up, so
+    "image/png" with two million spaces after it resolves to `.png` and sails
+    past the unsupported-type cap next door. The mismatch error then quoted the
+    field as sent: 2,000,103 characters on stderr, with the sentence saying the
+    file was refused pushed off the screen ahead of them.
+    """
+    padded = ToolImage(
+        mime_type="image/png" + " " * PADDED_MIME_TYPE_SPACES,
+        data_base64=base64.b64encode(b"#!/bin/sh").decode(),
+    )
+
+    assert padded.file_extension() == ".png", "the padding has to survive the lookup"
+    with pytest.raises(StudioMcpError) as raised:
+        padded.decoded_bytes()
+
+    assert len(str(raised.value)) < MAX_DIAGNOSTIC_TEXT_CHARS * 2, len(str(raised.value))
+    assert "signature mismatch" in str(raised.value)
+    assert "image/png" in str(raised.value), "the caller still needs the type it declared"
 
 
 def test_an_unsupported_mime_type_is_capped_before_it_is_quoted():
