@@ -23,6 +23,10 @@ Design notes worth knowing before editing:
   the caller blocks on data it already has. What those raw bytes mean is
   `framing`'s job: this module hands each read to a `StdoutFrameReader` and takes
   parsed messages back.
+- The protocol runs both ways. A server makes requests of its client too, and
+  numbers them from 1 as we do, so a frame carrying our id can be a question
+  rather than an answer: only one with no `method` is ours. Questions get one
+  reply, -32601, so a conformant server stops waiting on us.
 - Both pipes are bounded. stdout's three bounds live in `framing` (a per-frame
   cap, a per-request parse budget, and dropping a large frame that answers
   another request); `STDERR_MAX_LINE_BYTES` does the same job on the other pipe.
@@ -54,11 +58,13 @@ from roblox_studio_cli.framing import (
     MAX_REQUEST_TOTAL_BYTES,
     MAX_TOOLS_LIST_TOTAL_BYTES,
     StdoutFrameReader,
+    response_matches_request,
 )
 from roblox_studio_cli.mcp_payloads import (
     ToolCallResult,
     ToolDefinition,
     build_tool_definitions,
+    method_not_found_reply,
     parse_tool_call_result,
     raise_for_rpc_error,
 )
@@ -96,29 +102,6 @@ STUDIO_NOT_ENABLED_MESSAGE = (
     "Assistant settings > MCP Servers > Enable Studio as MCP server."
 )
 PROXY_NO_TOOLS_STDERR_MARKER = "Timed out waiting for tools to become available"
-
-
-def response_matches_request(message: dict, request_id: int) -> bool:
-    """True when this message is the answer to `request_id`, bare or string-shaped.
-
-    JSON-RPC lets an id be a number or a string, and a server echoing our `7` as
-    `"7"` is answering us just as squarely. `framing.awaited_id_pattern` already
-    reads both forms, so the large-frame peek keeps such a frame; matching it
-    here with `==` against an int then refused it, and since nothing else was
-    coming the call burned its whole deadline against a server that had already
-    answered.
-
-    Booleans are excluded explicitly: `True == 1` in Python, and a frame
-    answering `"id": true` is not the answer to request 1.
-    """
-    answered = message.get("id")
-    if isinstance(answered, bool):
-        return False
-    if isinstance(answered, int):
-        return answered == request_id
-    if isinstance(answered, str):
-        return answered == str(request_id)
-    return False
 
 
 def resolve_studio_binary_path() -> str:
@@ -404,8 +387,9 @@ class StudioMcpClient:
     def read_response(self, request_id: int, deadline: float) -> dict | None:
         """Read messages until the response with `request_id` arrives or time runs out.
 
-        Server-initiated notifications and stray ids are logged and skipped; only
-        the matching response is returned. `None` means the deadline passed.
+        Notifications and stray ids are logged and skipped, a request the
+        server made of us is declined, and only the matching response comes
+        back. `None` means the deadline passed.
         """
         while True:
             message = self.read_message(deadline, awaited_id=request_id)
@@ -413,7 +397,23 @@ class StudioMcpClient:
                 return None
             if response_matches_request(message, request_id):
                 return message
+            self.decline_server_request(message, deadline)
             logger.debug("skipping %r while waiting for id %d", message.get("method") or message.get("id"), request_id)
+
+    def decline_server_request(self, message: dict, deadline: float) -> None:
+        """Answer a request the BRIDGE made of us with "method not found".
+
+        A conformant server waits for a reply to every request it sends, so
+        silence parks it until its own timeout. Best effort against the
+        caller's deadline: being polite must not cost them their answer.
+        """
+        reply = method_not_found_reply(message)
+        if reply is None:
+            return
+        try:
+            self.send_message(reply, deadline=deadline)
+        except StudioMcpError as reply_error:
+            logger.debug("could not decline a server-to-client request: %s", reply_error)
 
     def read_message(self, deadline: float, awaited_id: int | None = None) -> dict | None:
         """Pop the next parsed JSON-RPC message, or `None` once `deadline` passes.

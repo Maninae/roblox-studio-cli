@@ -11,8 +11,8 @@ Orientation for anyone (human or agent) changing this repo. The README explains 
 | `errors.py` | The exception taxonomy, and the exit code each class maps onto. A leaf, so every layer can raise the same classes. |
 | `terminal.py` | Strip terminal control sequences out of server-controlled text before echoing it. |
 | `mcp_payloads.py` | The payload shapes a server answers with: tool definitions, tool results, images, the JSON-RPC error envelope. |
-| `framing.py` | Stdout bytes to JSON-RPC messages: line buffering, defensive parsing, the byte budgets, the large-frame id peek. Knows nothing of processes. |
-| `client.py` | Process and protocol. Spawn the proxy, run the handshake, write requests, match responses, drain stderr, reap the child. |
+| `framing.py` | Stdout bytes to JSON-RPC messages: line buffering, defensive parsing, the byte budgets, the large-frame id peek, and which parsed frame answers the request in flight. Knows nothing of processes. |
+| `client.py` | Process and protocol. Spawn the proxy, run the handshake, write requests, read the answer, decline the questions the server asks back, drain stderr, reap the child. |
 | `discovery.py` | Which live tool to call, with which arguments, on which Studio instance. Includes the attach poll. |
 | `image_output.py` | Where a returned image lands on disk, and the refusals on the way (traversal, symlink, clobber). |
 | `luau_source.py` | Where one `luau` call's source comes from: an argument, stdin, or a file, with the same byte cap on the two that read somebody else's bytes. |
@@ -45,6 +45,8 @@ Tool output is never capped: it is the thing the caller asked for. Neither is `-
 **Never cache a Studio instance id.** Studio attaches to a client a few seconds after it connects, instances open and close between commands, and ids do not survive a Studio restart. `wait_for_studio_instances` polls every 0.5s for up to 12s (bounded by `--timeout`), treating both an empty list and an error from the lister as "not yet".
 
 **Bound both pipes, and never block on either.** A cap on one frame is not a cap on memory, because parsing JSON multiplies size many times over, so stdout has three bounds, all of them in `framing`: `MAX_MESSAGE_BYTES` (8 MB) per frame with the scan resuming where it stopped, a per-request total (`MAX_REQUEST_TOTAL_BYTES`, and `MAX_TOOLS_LIST_TOTAL_BYTES` across all pages of a list), and a rule that a frame over `LARGE_FRAME_BYTES` positively carrying another request's id is dropped unparsed. That last rule searches for the AWAITED id first and drops a frame only when it is absent from both windows: a large answer quoting some other id in its payload (a place id, an instance record) is still ours, and dropping it used to cost the caller the entire timeout. stderr uses a capped `readline` into a ring buffer, keeping each over-long line's tail. The request write is non-blocking and runs against the same deadline as the read: a proxy that stops reading used to park the process inside `write()` forever once the pipe buffer filled.
+
+**A frame carrying `method` is a question, never our answer.** MCP runs in both directions, and a server numbers the requests it makes of its client (`roots/list`, `sampling/createMessage`, `elicitation/create`) from 1 exactly as we number ours, so one can arrive wearing the id we are waiting on. `framing.response_matches_request` refuses any frame with a `method`, because a JSON-RPC response never has one; read as the answer, such a frame has no `result`, so `tools/list` failed with "returned a non-object result (NoneType)" while the real answer sat one frame behind it. `client.decline_server_request` then answers -32601, since a conformant server waits for a reply to every request it sends. The reply is best effort against the caller's own deadline: being polite must not cost them their answer.
 
 **Known limits, accepted deliberately.** Two costs a hostile proxy can impose that the budgets bound rather than prevent, both worth knowing before someone reports them as bugs:
 
@@ -100,6 +102,7 @@ No Roblox needed: `tests/fake_studio_mcp_server.py` speaks the same wire protoco
 | `odd-serverinfo` | The handshake names the server with a bare string where the spec has an object. |
 | `lone-surrogate` | A `\udcff` in the server name, the instance name and a tool result: legal JSON, unencodable as UTF-8. |
 | `string-ids` | Every response echoes the request id as a string, which JSON-RPC allows. |
+| `client-request-collision` | The server asks the client `roots/list` wearing the id of the request it is about to answer. |
 
 Against real Studio, the end-to-end check is `roblox-studio doctor`, then `state`, then `luau 'return game.Name'`, then `screenshot --wake-display`. Expect about three seconds per command: that is Studio attaching, not the CLI being slow. A capture against a sleeping display never answers at all, which is what `--wake-display` is for.
 

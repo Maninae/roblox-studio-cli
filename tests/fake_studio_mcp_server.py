@@ -66,6 +66,11 @@ What the pipe is doing (the transport's own hazards):
                    file extension for, so the bytes exist and the file cannot
     string-ids     every response echoes the request id as a string, which JSON-RPC
                    allows and which a client matching on `==` never recognises
+    client-request-collision
+                   the server asks the client a question (`roots/list`) carrying
+                   the id of the request the client is waiting on, ahead of the
+                   real answer: bidirectional MCP, where a request and a
+                   response can wear the same number
 """
 
 import json
@@ -106,6 +111,10 @@ ATTACH_EMPTY_POLLS = 1
 # The real finding was a 6 MB serverInfo name; 100 KB proves the same cap and
 # keeps the suite fast.
 GIANT_TEXT_CHARS = 100_000
+
+# What this server logs when the client answers a question it asked. A test
+# reads it out of the client's own stderr buffer.
+CLIENT_REPLY_MARKER = "client answered our roots/list with code"
 
 OVERLONG_STDERR_LINE_BYTES = 200_000
 PARTIAL_WRITE_DELAY_SECONDS = 0.1
@@ -458,6 +467,31 @@ def decoy_id_answer(request_id: int) -> dict:
     return {"jsonrpc": "2.0", "result": result, "id": request_id}
 
 
+def ask_the_client_a_question(request_id: int, mode: str) -> None:
+    """Send a server-to-client REQUEST wearing the id the client is waiting on.
+
+    MCP servers call `roots/list`, `sampling/createMessage` and
+    `elicitation/create` on their clients, numbering those requests from 1 just
+    as the client numbers its own. Nothing keeps the two counters apart, so a
+    question and an answer can wear the same number; only the `method` member
+    tells them apart.
+    """
+    emit({"jsonrpc": "2.0", "id": request_id, "method": "roots/list"}, mode)
+
+
+def note_client_reply(message: dict) -> None:
+    """Record on stderr what the client answered our question with.
+
+    stderr because the client keeps the proxy's stderr and shows it, which is
+    what lets a test see that the reply arrived at all rather than that the
+    client merely carried on.
+    """
+    error = message.get("error")
+    code = error.get("code") if isinstance(error, dict) else None
+    sys.stderr.write(f"{CLIENT_REPLY_MARKER} {code}\n")
+    sys.stderr.flush()
+
+
 def flood_stderr() -> None:
     """One line far longer than the client's per-line cap, then an ordinary line."""
     sys.stderr.write("x" * OVERLONG_STDERR_LINE_BYTES + "\n")
@@ -469,6 +503,13 @@ def handle_request(message: dict, mode: str) -> None:
     """Answer one client message according to the selected mode."""
     method = message.get("method")
     request_id = message.get("id")
+
+    if method is None:
+        # A response, not a request: the client answering something we asked.
+        # Replying to it would put a second frame with that id on the wire.
+        if mode == "client-request-collision":
+            note_client_reply(message)
+        return
 
     if method == "initialize":
         emit(
@@ -502,6 +543,8 @@ def handle_request(message: dict, mode: str) -> None:
             # Not a JSON-RPC frame at all; the client must skip it and read on.
             sys.stdout.write("[1, 2]\n")
             sys.stdout.flush()
+        if mode == "client-request-collision":
+            ask_the_client_a_question(request_id, mode)
         emit(
             {
                 "jsonrpc": "2.0",

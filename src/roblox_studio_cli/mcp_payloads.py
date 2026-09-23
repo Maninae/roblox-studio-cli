@@ -1,6 +1,7 @@
 """The payload shapes an MCP server answers with, and how to read them safely.
 
-Tool definitions, tool call results, and the JSON-RPC error envelope.
+Tool definitions, tool call results, the JSON-RPC error envelope, and the one
+frame that is not an answer at all: a request the SERVER makes of its client.
 
 Split out of `client` so the transport stays about bytes on a pipe while these
 stay about payloads, and so anything that needs a `ToolDefinition` (discovery,
@@ -42,6 +43,15 @@ IMAGE_SIGNATURES_BY_FILE_EXTENSION: dict[str, tuple[tuple[int, bytes], ...]] = {
 }
 
 DESCRIPTION_PREVIEW_CHARS = 100
+
+# The JSON-RPC code for a method this peer does not implement, which is the
+# whole of this client's answer to a server-to-client request.
+METHOD_NOT_FOUND_CODE = -32601
+METHOD_NOT_FOUND_MESSAGE = "this client implements no server-to-client requests"
+# How long an id we will echo back into such a reply. The server chose the id,
+# the reply is a courtesy, and a courtesy is not worth writing a megabyte-long
+# id back down the pipe for.
+MAX_ECHOED_REQUEST_ID_CHARS = 128
 
 # A non-boolean `isError` is a fact about the BUILD, not about one result, and
 # the attach poll alone calls a tool two dozen times inside one command. Said
@@ -251,6 +261,37 @@ def build_tool_definitions(entries: list) -> list[ToolDefinition]:
             )
         )
     return definitions
+
+
+def method_not_found_reply(message: dict) -> dict | None:
+    """The error reply for a request the BRIDGE made of us, or None if it made none.
+
+    MCP is bidirectional. A server may call `roots/list`,
+    `sampling/createMessage` or `elicitation/create` on its client, and it
+    numbers those requests from 1 exactly the way we number ours, so
+    `{"jsonrpc": "2.0", "id": 2, "method": "roots/list"}` can arrive while we
+    are waiting on our own id 2. It is a request, not an answer (a JSON-RPC
+    response never carries `method`), and leaving it unanswered parks a
+    conformant server until its own timeout. This client implements none of
+    those methods, so -32601 is the honest reply.
+
+    Returns None when there is nothing to answer: a response, a notification (a
+    method with no id), or an id shaped like nothing worth echoing back, which
+    is a bool, a float, or a string whose length the server would be choosing
+    for our write.
+    """
+    if not isinstance(message.get("method"), str):
+        return None
+    answered_id = message.get("id")
+    if isinstance(answered_id, bool) or not isinstance(answered_id, (int, str)):
+        return None
+    if isinstance(answered_id, str) and len(answered_id) > MAX_ECHOED_REQUEST_ID_CHARS:
+        return None
+    return {
+        "jsonrpc": "2.0",
+        "id": answered_id,
+        "error": {"code": METHOD_NOT_FOUND_CODE, "message": METHOD_NOT_FOUND_MESSAGE},
+    }
 
 
 def raise_for_rpc_error(response: dict) -> None:

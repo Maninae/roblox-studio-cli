@@ -17,6 +17,11 @@ parsed message", which is a job with its own hazards:
 - The id peek. Past `LARGE_FRAME_BYTES` a frame is worth identifying before it is
   parsed: one that positively answers a DIFFERENT request is dropped for the cost
   of a regex over both ends of the line instead of a full parse.
+- Which frame is ours. The peek's rule (`awaited_id_pattern`) and the parsed
+  frame's rule (`response_matches_request`) have to agree about what answers a
+  request, so they live side by side: when they disagreed about a string-shaped
+  id, the peek kept the frame and the matcher refused it, and the caller waited
+  out a deadline against a server that had already answered.
 
 Nothing here touches the process or the file descriptors, so a framing bug can be
 reproduced by handing `feed()` some bytes.
@@ -68,6 +73,36 @@ def awaited_id_pattern(awaited_id: int) -> re.Pattern:
     non-digit, so a wait for 7 is not satisfied by 71.
     """
     return re.compile(rb'"id"\s*:\s*(?:%d(?![0-9])|"%d")' % (awaited_id, awaited_id))
+
+
+def response_matches_request(message: dict, request_id: int) -> bool:
+    """True when this parsed message is the answer to `request_id`.
+
+    Three rules, each one a frame that looked like our answer and was not:
+
+    - A frame carrying `method` is a REQUEST, never a response. MCP servers ask
+      their clients things (`roots/list`, `sampling/createMessage`,
+      `elicitation/create`) and number those requests from 1 like the client's
+      own counter, so one can wear the id we await. Taken as the answer it has
+      no `result`: `tools/list` died with "returned a non-object result
+      (NoneType)" while the real answer sat one frame behind it.
+    - A string id that reads as ours IS ours. JSON-RPC allows it and
+      `awaited_id_pattern` above keeps such a frame, so refusing it here with
+      `==` against an int burned the whole deadline against a server that had
+      already answered.
+    - A boolean id is not the integer it equals: `True == 1`, and `"id": true`
+      is the answer to nothing.
+    """
+    if "method" in message:
+        return False
+    answered = message.get("id")
+    if isinstance(answered, bool):
+        return False
+    if isinstance(answered, int):
+        return answered == request_id
+    if isinstance(answered, str):
+        return answered == str(request_id)
+    return False
 
 
 class StdoutFrameReader:

@@ -21,6 +21,7 @@ from roblox_studio_cli.framing import (
     MAX_MESSAGE_BYTES,
     MAX_TOOLS_LIST_TOTAL_BYTES,
     StdoutFrameReader,
+    response_matches_request,
 )
 
 AWAITED_ID = 7
@@ -221,3 +222,35 @@ def test_a_neighbouring_id_does_not_pass_for_the_awaited_one():
     reader.feed(frame_quoting_another_id_first(AWAITED_ID * 10 + 1), awaited_id=AWAITED_ID)
     assert drain(reader) == []
     assert reader.skipped_large_frames == 1
+
+
+@pytest.mark.parametrize(
+    "answered, matches, reason",
+    [
+        (AWAITED_ID, True, "our own id, exactly as we sent it"),
+        (str(AWAITED_ID), True, "the same id, echoed as a string"),
+        (AWAITED_ID * 10 + 1, False, "a neighbouring id is somebody else's"),
+        (str(AWAITED_ID * 10 + 1), False, "the same, as a string"),
+        (None, False, "a notification carries no id"),
+        ("", False, "an empty id answers nothing"),
+    ],
+)
+def test_a_string_shaped_id_that_equals_ours_is_ours(answered, matches, reason):
+    """The large-frame peek accepts `"id": "7"` as ours, so the matcher has to agree.
+
+    Disagreeing cost the whole timeout: the peek kept the frame, `==` against an
+    int refused it, and nothing else was ever going to arrive.
+    """
+    assert response_matches_request({"id": answered}, AWAITED_ID) is matches, reason
+
+
+def test_a_boolean_id_is_not_the_integer_it_equals():
+    """`True == 1` in Python, and a frame answering `"id": true` is not answering id 1."""
+    assert response_matches_request({"id": True}, 1) is False
+
+
+@pytest.mark.parametrize("answered", [AWAITED_ID, str(AWAITED_ID)])
+def test_a_frame_carrying_a_method_is_a_question_not_our_answer(answered):
+    """A JSON-RPC response never carries `method`, whatever id it wears."""
+    question = {"jsonrpc": "2.0", "id": answered, "method": "roots/list"}
+    assert response_matches_request(question, AWAITED_ID) is False

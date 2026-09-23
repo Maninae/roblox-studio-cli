@@ -13,9 +13,13 @@ import pytest
 from roblox_studio_cli import mcp_payloads as mcp_payloads_module
 from roblox_studio_cli.errors import StudioMcpError, StudioMcpProtocolError
 from roblox_studio_cli.mcp_payloads import (
+    MAX_ECHOED_REQUEST_ID_CHARS,
+    METHOD_NOT_FOUND_CODE,
+    METHOD_NOT_FOUND_MESSAGE,
     ToolDefinition,
     ToolImage,
     build_tool_definitions,
+    method_not_found_reply,
     parse_tool_call_result,
     raise_for_rpc_error,
 )
@@ -159,6 +163,36 @@ def test_the_protocol_warning_is_said_once_for_the_process_not_once_per_result(
         for _ in range(24):
             assert parse_tool_call_result({"isError": "false"}).is_error is True
     assert len(caplog.records) == 1, f"warned {len(caplog.records)} times"
+
+
+@pytest.mark.parametrize("answered_id", [2, "2"])
+def test_a_request_the_server_makes_of_us_is_answered_method_not_found(answered_id):
+    """MCP servers call `roots/list` and friends on their clients; we implement none."""
+    reply = method_not_found_reply(
+        {"jsonrpc": "2.0", "id": answered_id, "method": "roots/list"}
+    )
+    assert reply == {
+        "jsonrpc": "2.0",
+        "id": answered_id,
+        "error": {"code": METHOD_NOT_FOUND_CODE, "message": METHOD_NOT_FOUND_MESSAGE},
+    }
+
+
+@pytest.mark.parametrize(
+    "message, reason",
+    [
+        ({"id": 2, "result": {}}, "a response is an answer, not a question"),
+        ({"id": 2, "error": {"code": -1}}, "so is an error response"),
+        ({"method": "notifications/message"}, "a notification wants no reply"),
+        ({"id": None, "method": "roots/list"}, "and neither does a null id"),
+        ({"id": True, "method": "roots/list"}, "a bool is not a JSON-RPC id"),
+        ({"id": 1.5, "method": "roots/list"}, "nor is a fraction"),
+        ({"id": "x" * (MAX_ECHOED_REQUEST_ID_CHARS + 1), "method": "roots/list"},
+         "the server would be choosing the size of our write"),
+    ],
+)
+def test_nothing_is_replied_to_a_frame_that_asked_nothing(message, reason):
+    assert method_not_found_reply(message) is None, reason
 
 
 def test_raise_for_rpc_error_reads_both_shapes():

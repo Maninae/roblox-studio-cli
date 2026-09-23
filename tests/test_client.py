@@ -20,6 +20,7 @@ import time
 from pathlib import Path
 
 import pytest
+from fake_studio_mcp_server import CLIENT_REPLY_MARKER
 
 from roblox_studio_cli import client as client_module
 from roblox_studio_cli.client import (
@@ -28,7 +29,6 @@ from roblox_studio_cli.client import (
     STDERR_QUOTE_LINES,
     STUDIO_NOT_ENABLED_MESSAGE,
     StudioMcpClient,
-    response_matches_request,
 )
 from roblox_studio_cli.errors import (
     StudioMcpError,
@@ -37,6 +37,7 @@ from roblox_studio_cli.errors import (
     StudioNotConnectedError,
 )
 from roblox_studio_cli.framing import MAX_MESSAGE_BYTES
+from roblox_studio_cli.mcp_payloads import METHOD_NOT_FOUND_CODE
 from roblox_studio_cli.terminal import MAX_DIAGNOSTIC_TEXT_CHARS
 
 FAKE_SERVER_PATH = Path(__file__).resolve().parent / "fake_studio_mcp_server.py"
@@ -44,9 +45,12 @@ PNG_MAGIC_BYTES = b"\x89PNG\r\n\x1a\n"
 SILENT_SERVER_TIMEOUT_SECONDS = 2.0
 DEAF_SERVER_TIMEOUT_SECONDS = 2.0
 STUDIO_ID = "studio-1"
-AWAITED_REQUEST_ID = 7
 STRAY_FRAME_COUNT = 6
 DECOY_ANSWER_TIMEOUT_SECONDS = 3.0
+# The reply to a server's question travels a second pipe and a drain thread, so
+# it is read out of stderr with a bounded wait rather than assumed to be there.
+SERVER_REPLY_WAIT_SECONDS = 5.0
+STDERR_POLL_INTERVAL_SECONDS = 0.05
 
 # Answers the handshake, then swallows everything else without logging a thing:
 # silence that is NOT the Studio toggle, and must not be reported as the toggle.
@@ -341,29 +345,31 @@ def test_a_server_that_stops_reading_its_input_times_out_instead_of_wedging(fake
     assert time.monotonic() - started < DEAF_SERVER_TIMEOUT_SECONDS * 3, "the write outlived it"
 
 
-@pytest.mark.parametrize(
-    "answered, matches, reason",
-    [
-        (AWAITED_REQUEST_ID, True, "our own id, exactly as we sent it"),
-        (str(AWAITED_REQUEST_ID), True, "the same id, echoed as a string"),
-        (AWAITED_REQUEST_ID * 10 + 1, False, "a neighbouring id is somebody else's"),
-        (str(AWAITED_REQUEST_ID * 10 + 1), False, "the same, as a string"),
-        (None, False, "a notification carries no id"),
-        ("", False, "an empty id answers nothing"),
-    ],
-)
-def test_a_string_shaped_id_that_equals_ours_is_ours(answered, matches, reason):
-    """The large-frame peek accepts `"id": "7"` as ours, so the matcher has to agree.
+def test_a_server_request_wearing_our_id_does_not_stand_in_for_the_answer(fake_client):
+    """MCP runs both ways, and the server's counter starts at 1 just like ours.
 
-    Disagreeing cost the whole timeout: the peek kept the frame, `==` against an
-    int refused it, and nothing else was ever going to arrive.
+    The fake asks `roots/list` carrying the id of the `tools/list` it is about
+    to answer. Read as a response, that frame has no `result`, so the call died
+    with "returned a non-object result (NoneType)" and the real answer, one
+    frame behind it, was never looked at.
     """
-    assert response_matches_request({"id": answered}, AWAITED_REQUEST_ID) is matches, reason
+    tools = fake_client("client-request-collision").list_tools()
+    assert "execute_luau" in [tool.name for tool in tools]
 
 
-def test_a_boolean_id_is_not_the_integer_it_equals():
-    """`True == 1` in Python, and a frame answering `"id": true` is not answering id 1."""
-    assert response_matches_request({"id": True}, 1) is False
+def test_a_request_the_server_makes_of_us_is_declined_rather_than_ignored(fake_client):
+    """A conformant server waits for a reply to every request it sends.
+
+    The fake logs what came back to its own stderr, so this reads the reply off
+    the wire rather than trusting that the client carried on afterwards.
+    """
+    client = fake_client("client-request-collision")
+    client.list_tools()
+    expected = f"{CLIENT_REPLY_MARKER} {METHOD_NOT_FOUND_CODE}"
+    deadline = time.monotonic() + SERVER_REPLY_WAIT_SECONDS
+    while expected not in client.recent_stderr() and time.monotonic() < deadline:
+        time.sleep(STDERR_POLL_INTERVAL_SECONDS)
+    assert expected in client.recent_stderr(), "the server was left waiting for a reply"
 
 
 def test_a_server_that_echoes_ids_as_strings_is_answered_normally(fake_client):
