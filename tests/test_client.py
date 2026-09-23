@@ -20,7 +20,7 @@ import time
 from pathlib import Path
 
 import pytest
-from fake_studio_mcp_server import CLIENT_REPLY_MARKER
+from fake_studio_mcp_server import CLIENT_REPLY_MARKER, QUESTION_FLOOD_COUNT
 
 from roblox_studio_cli import client as client_module
 from roblox_studio_cli.client import (
@@ -51,6 +51,11 @@ DECOY_ANSWER_TIMEOUT_SECONDS = 3.0
 # it is read out of stderr with a bounded wait rather than assumed to be there.
 SERVER_REPLY_WAIT_SECONDS = 5.0
 STDERR_POLL_INTERVAL_SECONDS = 0.05
+# The flood test's deadline, and the share of it an answer that was never
+# waited on should need. Before the fix the first reply that could not be
+# written consumed the whole deadline and the call ended in a timeout.
+QUESTION_FLOOD_TIMEOUT_SECONDS = 6.0
+QUESTION_FLOOD_PROMPT_SECONDS = 2.5
 
 # Answers the handshake, then swallows everything else without logging a thing:
 # silence that is NOT the Studio toggle, and must not be reported as the toggle.
@@ -380,3 +385,25 @@ def test_a_server_that_echoes_ids_as_strings_is_answered_normally(fake_client):
     )
     assert result.is_error is False
     assert "luau ok" in result.text
+
+
+def test_a_burst_of_questions_does_not_cost_the_caller_their_answer(fake_client):
+    """Declining is a courtesy; the caller's answer is the job.
+
+    The fake asks 3,000 questions ahead of the answer and then stops reading,
+    so every reply past the first pipeful has nowhere to go. Writing each of
+    them against the caller's deadline stopped reading stdout while it waited:
+    measured before the fix, 150 questions delayed the answer until the whole
+    deadline had passed and 700 turned it into a timeout, with the answer
+    already on the pipe. One non-blocking write each, dropped when the pipe is
+    full, costs nothing.
+    """
+    client = fake_client("question-flood")
+    started = time.monotonic()
+    tools = client.list_tools(timeout=QUESTION_FLOOD_TIMEOUT_SECONDS)
+    elapsed = time.monotonic() - started
+
+    assert "execute_luau" in [tool.name for tool in tools], "the answer behind the flood was lost"
+    assert elapsed < QUESTION_FLOOD_PROMPT_SECONDS, (
+        f"{QUESTION_FLOOD_COUNT} questions cost the caller {elapsed:.1f}s"
+    )

@@ -26,7 +26,9 @@ Design notes worth knowing before editing:
 - The protocol runs both ways. A server makes requests of its client too, and
   numbers them from 1 as we do, so a frame carrying our id can be a question
   rather than an answer: only one with no `method` is ours. Questions get one
-  reply, -32601, so a conformant server stops waiting on us.
+  reply, -32601, so a conformant server stops waiting on us. That reply is a
+  single non-blocking write, dropped when the pipe is full, because the caller
+  is waiting on their own answer while we are polite.
 - Both pipes are bounded. stdout's three bounds live in `framing` (a per-frame
   cap, a per-request parse budget, and dropping a large frame that answers
   another request); `STDERR_MAX_LINE_BYTES` does the same job on the other pipe.
@@ -89,6 +91,10 @@ STDOUT_READ_CHUNK_BYTES = 65536
 STDERR_MAX_LINE_BYTES = 64 * 1024
 # A write that cannot make progress in this long is a proxy that stopped reading.
 DEFAULT_WRITE_TIMEOUT_SECONDS = 15.0
+# The most a decline may be. POSIX makes a pipe write of at most PIPE_BUF bytes
+# all-or-nothing, which is what lets the reply be attempted once and abandoned:
+# what reaches the proxy is the whole frame or none of it, never half of one.
+MAX_DECLINE_REPLY_BYTES = select.PIPE_BUF
 # Measured against Studio 0.739: the real proxy exits 0 within 10 ms of stdin
 # EOF, so this grace only ever pays out for a wedged child.
 SHUTDOWN_GRACE_SECONDS = 3.0
@@ -398,22 +404,40 @@ class StudioMcpClient:
                 return None
             if response_matches_request(message, request_id):
                 return message
-            self.decline_server_request(message, deadline)
+            self.decline_server_request(message)
             logger.debug("skipping %r while waiting for id %d", message.get("method") or message.get("id"), request_id)
 
-    def decline_server_request(self, message: dict, deadline: float) -> None:
+    def decline_server_request(self, message: dict) -> None:
         """Answer a request the BRIDGE made of us with "method not found".
 
         A conformant server waits for a reply to every request it sends, so
-        silence parks it until its own timeout. Best effort against the
-        caller's deadline: being polite must not cost them their answer.
+        silence parks it until its own timeout. Being polite must not cost the
+        caller their answer, though, which is why this is ONE non-blocking write
+        and never a loop. `write_all` retries against the caller's deadline and
+        stops reading stdout while it does, so a burst of questions from a
+        server that has paused reading turned the courtesy into the caller's
+        whole timeout: measured on the fake bridge, 150 questions delayed the
+        answer until the 3 s deadline, and 700 ended in a timeout with the
+        answer already sitting on the pipe.
+
+        So the reply is dropped rather than retried when the pipe is full
+        (`BlockingIOError`), and skipped outright when it would exceed
+        `MAX_DECLINE_REPLY_BYTES`, since only a write that small is atomic.
         """
+        if self.stdin_fd is None:
+            return
         reply = method_not_found_reply(message)
         if reply is None:
             return
+        payload = (json.dumps(reply) + "\n").encode("utf-8")
+        if len(payload) > MAX_DECLINE_REPLY_BYTES:
+            logger.debug("not declining a server request: a %d byte reply", len(payload))
+            return
         try:
-            self.send_message(reply, deadline=deadline)
-        except StudioMcpError as reply_error:
+            os.write(self.stdin_fd, payload)
+        except (OSError, ValueError) as reply_error:
+            # BlockingIOError lands here too: the proxy is not reading its
+            # input, and a courtesy is not worth waiting on.
             logger.debug("could not decline a server-to-client request: %s", reply_error)
 
     def read_message(self, deadline: float, awaited_id: int | None = None) -> dict | None:

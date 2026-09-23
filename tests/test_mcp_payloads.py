@@ -6,7 +6,9 @@ payload that does not match its declared type are both refusals, not guesses.
 """
 
 import base64
+import json
 import logging
+import select
 
 import pytest
 
@@ -220,10 +222,26 @@ def test_a_request_the_server_makes_of_us_is_answered_method_not_found(answered_
         ({"id": 1.5, "method": "roots/list"}, "nor is a fraction"),
         ({"id": "x" * (MAX_ECHOED_REQUEST_ID_CHARS + 1), "method": "roots/list"},
          "the server would be choosing the size of our write"),
+        ({"id": 10 ** (MAX_ECHOED_REQUEST_ID_CHARS + 1), "method": "roots/list"},
+         "a number chooses the size of our write the same way a string does"),
     ],
 )
 def test_nothing_is_replied_to_a_frame_that_asked_nothing(message, reason):
     assert method_not_found_reply(message) is None, reason
+
+
+@pytest.mark.parametrize("answered_id", [10**8, -(10**8), "x" * MAX_ECHOED_REQUEST_ID_CHARS])
+def test_an_echoed_id_within_the_cap_keeps_the_reply_atomically_writable(answered_id):
+    """The decline is written once, unretried, so it has to fit one atomic pipe write.
+
+    PIPE_BUF is 512 bytes on macOS, and anything at or under it reaches the
+    proxy whole or not at all. An id is echoed verbatim, so the cap on it is
+    what keeps that true; `client.decline_server_request` measures the encoded
+    reply as well, for an id whose escapes are longer than its characters.
+    """
+    reply = method_not_found_reply({"id": answered_id, "method": "roots/list"})
+    assert reply is not None
+    assert len(json.dumps(reply).encode()) < select.PIPE_BUF
 
 
 def test_raise_for_rpc_error_reads_both_shapes():

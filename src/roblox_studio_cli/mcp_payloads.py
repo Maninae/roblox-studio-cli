@@ -54,8 +54,13 @@ METHOD_NOT_FOUND_CODE = -32601
 METHOD_NOT_FOUND_MESSAGE = "this client implements no server-to-client requests"
 # How long an id we will echo back into such a reply. The server chose the id,
 # the reply is a courtesy, and a courtesy is not worth writing a megabyte-long
-# id back down the pipe for.
+# id back down the pipe for. A number is measured the same way as a string,
+# because `10 ** 4000` is a 4,001-character id too, and the reply has to stay
+# small enough for the single atomic pipe write `client.decline_server_request`
+# gives it. Magnitude rather than `str()`: past 4,300 digits `str()` on an int
+# raises instead of answering.
 MAX_ECHOED_REQUEST_ID_CHARS = 128
+MAX_ECHOED_INTEGER_ID = 10**MAX_ECHOED_REQUEST_ID_CHARS
 
 # A non-boolean `isError` is a fact about the BUILD, not about one result, and
 # the attach poll alone calls a tool two dozen times inside one command. Said
@@ -288,15 +293,21 @@ def method_not_found_reply(message: dict) -> dict | None:
 
     Returns None when there is nothing to answer: a response, a notification (a
     method with no id), or an id shaped like nothing worth echoing back, which
-    is a bool, a float, or a string whose length the server would be choosing
-    for our write.
+    is a bool, a float, or an id whose length the server would be choosing for
+    our write. That last rule counts a number's digits as well as a string's
+    characters: an id is echoed verbatim, so both decide how big our reply is.
     """
     if not isinstance(message.get("method"), str):
         return None
     answered_id = message.get("id")
     if isinstance(answered_id, bool) or not isinstance(answered_id, (int, str)):
         return None
-    if isinstance(answered_id, str) and len(answered_id) > MAX_ECHOED_REQUEST_ID_CHARS:
+    too_long_to_echo = (
+        abs(answered_id) >= MAX_ECHOED_INTEGER_ID
+        if isinstance(answered_id, int)
+        else len(answered_id) > MAX_ECHOED_REQUEST_ID_CHARS
+    )
+    if too_long_to_echo:
         return None
     return {
         "jsonrpc": "2.0",

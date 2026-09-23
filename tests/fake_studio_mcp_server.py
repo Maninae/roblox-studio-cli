@@ -71,6 +71,10 @@ What the pipe is doing (the transport's own hazards):
                    the id of the request the client is waiting on, ahead of the
                    real answer: bidirectional MCP, where a request and a
                    response can wear the same number
+    question-flood thousands of those questions ahead of the answer, and then a
+                   reader that pauses: every polite reply the client writes has
+                   nowhere to go once the pipe fills, so the courtesy must not
+                   become the caller's timeout
 """
 
 import json
@@ -115,6 +119,15 @@ GIANT_TEXT_CHARS = 100_000
 # What this server logs when the client answers a question it asked. A test
 # reads it out of the client's own stderr buffer.
 CLIENT_REPLY_MARKER = "client answered our roots/list with code"
+
+# Enough questions that the client's replies fill a 64 KB pipe several times
+# over, and a pause long enough that nothing drains it while the client is
+# reading its own answer. A client that writes each reply on the caller's
+# deadline stalls here; one that writes each once and drops what will not fit
+# does not.
+QUESTION_FLOOD_COUNT = 3000
+QUESTION_FLOOD_BASE_ID = 500_000
+QUESTION_FLOOD_PAUSE_SECONDS = 3.0
 
 OVERLONG_STDERR_LINE_BYTES = 200_000
 PARTIAL_WRITE_DELAY_SECONDS = 0.1
@@ -341,6 +354,10 @@ def tools_list_result(params: dict, mode: str) -> dict:
         return {"tools": [*TOOL_DEFINITIONS, *CROWD_TOOLS]}
     if mode == "giant-names":
         return {"tools": [*TOOL_DEFINITIONS, GIANT_NAME_TOOL]}
+    if mode == "question-flood":
+        # One page, so the pause after this answer is not what a second page
+        # would wait on: the test is timing the flood, not the sleep.
+        return {"tools": TOOL_DEFINITIONS}
     if params.get("cursor") == SECOND_PAGE_CURSOR:
         return {"tools": TOOL_DEFINITIONS[FIRST_PAGE_SIZE:]}
     return {"tools": TOOL_DEFINITIONS[:FIRST_PAGE_SIZE], "nextCursor": SECOND_PAGE_CURSOR}
@@ -479,6 +496,22 @@ def ask_the_client_a_question(request_id: int, mode: str) -> None:
     emit({"jsonrpc": "2.0", "id": request_id, "method": "roots/list"}, mode)
 
 
+def flood_the_client_with_questions(mode: str) -> None:
+    """Ask thousands of questions at once, then stop reading for a while.
+
+    Every question obliges a conformant client to reply, and this server is not
+    reading its stdin while it writes them, so the client's replies fill the
+    pipe and stay there. The pause after the answer keeps the pipe full for
+    longer than the test's deadline, which is what makes a client that waits on
+    each reply fail here rather than merely run slowly.
+    """
+    for index in range(QUESTION_FLOOD_COUNT):
+        emit(
+            {"jsonrpc": "2.0", "id": QUESTION_FLOOD_BASE_ID + index, "method": "roots/list"},
+            mode,
+        )
+
+
 def note_client_reply(message: dict) -> None:
     """Record on stderr what the client answered our question with.
 
@@ -545,6 +578,8 @@ def handle_request(message: dict, mode: str) -> None:
             sys.stdout.flush()
         if mode == "client-request-collision":
             ask_the_client_a_question(request_id, mode)
+        if mode == "question-flood":
+            flood_the_client_with_questions(mode)
         emit(
             {
                 "jsonrpc": "2.0",
@@ -553,6 +588,10 @@ def handle_request(message: dict, mode: str) -> None:
             },
             mode,
         )
+        if mode == "question-flood":
+            # Stay deaf to stdin so the replies the client wrote have nowhere
+            # to drain to while it reads the answer above.
+            time.sleep(QUESTION_FLOOD_PAUSE_SECONDS)
     elif method == "tools/call":
         answer = handle_tools_call(request_id, message.get("params", {}), mode)
         if answer is not None:
