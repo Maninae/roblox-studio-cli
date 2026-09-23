@@ -4,6 +4,13 @@ Three ways in, all resolved before the proxy is spawned, so a typo costs a
 message rather than a handshake: the source as an argument, `-` to read stdin,
 or `--file PATH`.
 
+Source given as an argument can start with a dash, because a Luau comment is
+`-- text` and a long string is `--[[ ... ]]`, and an option parser reads that as
+a flag: `luau '-- comment'` answered "No such option: -- comment". The command
+accepts unknown options as source for that reason, which puts a real typo
+(`--fiel x`) on the same path, so a value that starts with a dash and carries no
+whitespace is refused here as the mistyped option it almost certainly is.
+
 Both of the ways that read something else's bytes are bounded, and bounded the
 SAME way, because they end up in the same place: one JSON-RPC request down a
 pipe that holds about 64 KB, to a Studio text box that is not where a
@@ -53,6 +60,9 @@ STDIN_SOURCE_MARKER = "-"
 MAX_LUAU_SOURCE_BYTES = 8 * 2**20
 # Every door's answer to a request that carries no script.
 NO_SOURCE_MESSAGE = "provide Luau source as an argument, `-` to read stdin, or --file PATH"
+# How much of a dash-leading argument to quote back. The caller typed it, so
+# the point is to show which one was read, not to print all of it.
+OPTION_LOOKALIKE_PREVIEW_CHARS = 40
 # Invisible in an editor, a syntax error to Luau: an editor's BOM is not source.
 # Written as the escape on purpose, because the literal character is invisible
 # in this file too, and a reader cannot tell it from a stray space.
@@ -72,8 +82,11 @@ def read_luau_source(code: str | None, file_path: Path | None) -> str:
     Raises:
         StudioRequestError: no source at all (an absent argument, or an empty
             one from any of the three doors), both an argument and a `--file`,
-            or a file (or a stdin stream) this command will not read.
+            a first argument that reads as a mistyped option, or a file (or a
+            stdin stream) this command will not read.
     """
+    if code is not None:
+        refuse_option_lookalike(code)
     if file_path is not None:
         if code:
             raise StudioRequestError("pass Luau source as an argument or with --file, not both")
@@ -83,6 +96,30 @@ def read_luau_source(code: str | None, file_path: Path | None) -> str:
     if code == STDIN_SOURCE_MARKER:
         return require_luau_source(read_bounded_stdin())
     return require_luau_source(code)
+
+
+def refuse_option_lookalike(code: str) -> None:
+    """Refuse a first argument that reads as a mistyped option rather than source.
+
+    The `luau` command accepts unknown options as its source argument, because
+    Luau source legitimately starts with a dash (`-- a comment`, `--[[ block
+    ]]`) and an option parser will not hand such a value through otherwise. The
+    cost of that is a real typo arriving as the script Studio runs, so the two
+    are told apart the one way they differ: source that starts with a dash
+    carries a space or a newline, and `--fiel` does not.
+
+    Raises:
+        StudioRequestError: the argument is a lone dash-leading word.
+    """
+    if not code.startswith("-") or code == STDIN_SOURCE_MARKER:
+        return
+    if any(character.isspace() for character in code):
+        return
+    raise StudioRequestError(
+        f"{code[:OPTION_LOOKALIKE_PREVIEW_CHARS]!r} reads as a mistyped option rather than "
+        "Luau source. Source that starts with a dash goes after `--` "
+        "(roblox-studio luau -- '-- a comment'), or pass it with --file PATH."
+    )
 
 
 def require_luau_source(source: str) -> str:

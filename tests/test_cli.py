@@ -678,3 +678,32 @@ def test_json_output_is_one_compact_line():
     assert "\n" not in payload, "the payload is indented, so its size grows with its depth"
     assert '"ok":true' in payload
     assert json.loads(payload)["tool_count"] == 6
+
+
+@pytest.mark.parametrize("arguments", [["luau", "-- a comment"], ["luau", "--", "-- a comment"]])
+def test_luau_source_may_start_with_a_dash(arguments):
+    """A Luau comment is `-- text`, which an option parser reads as a flag.
+
+    Before this, `roblox-studio luau '-- a comment'` answered "No such option:
+    -- a comment" and the way through (`--`) was documented nowhere. Both forms
+    work now, and the `--` one is what the help and the README point at, since
+    it is the form that cannot be mistaken for anything.
+    """
+    result = invoke(arguments)
+    assert result.exit_code == EXIT_OK, all_output(result)
+    assert '"code": "-- a comment"' in all_output(result)
+
+
+@pytest.mark.parametrize("typo", ["--fiel", "-x", "--jsonn"])
+def test_a_mistyped_option_is_not_quietly_run_as_a_script(typo):
+    """The cost of accepting unknown options as source, paid back at the door.
+
+    A flag this CLI does not have would otherwise arrive as the script Studio
+    runs. Source that really starts with a dash has a space or a newline in it;
+    a mistyped flag does not, which is the whole of the test.
+    """
+    result = invoke(["luau", typo])
+    assert result.exit_code == EXIT_REQUEST_ERROR, all_output(result)
+    advice = all_output(result)
+    assert "mistyped option" in advice
+    assert "--file" in advice, "the message has to name a way through"

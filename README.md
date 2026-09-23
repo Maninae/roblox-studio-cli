@@ -79,9 +79,12 @@ With the Mac's display asleep, Studio accepts the capture and never answers, so 
 
 `luau` takes its source three ways: as an argument, from a file with `--file script.luau`, or from stdin with `-`. Both of the ways that read something else's bytes are capped at 8 MB of bytes, `--file` and `-` alike, both decode as strict UTF-8, and a `--file` must be an ordinary file. An empty one, from any of the three, is a message rather than a round trip to Studio that sends nothing, and "empty" includes a source that is only invisible characters: a stray BOM, a zero-width space, a NUL. Leading BOMs are stripped whichever way the source arrived, because an editor wrote them and Luau will not compile them.
 
+Source that starts with a dash (a `-- comment`, a `--[[ block ]]`) goes after `--`, because everything before it is read as flags. A flag this CLI does not have is refused rather than run as a script, so a typo cannot reach Studio as source.
+
 ```bash
 echo 'return #workspace:GetDescendants()' | roblox-studio luau -
 roblox-studio luau --file scripts/audit.luau --context Server
+roblox-studio luau -- '-- this comment is the whole script'
 ```
 
 ## Exit codes

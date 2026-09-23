@@ -393,10 +393,16 @@ def call(
     emit_result(result, tool, as_json, out, force)
 
 
-@app.command()
+# Unknown options reach the `code` argument instead of failing the parse, so
+# that source starting with a dash (`-- a comment`) is usable without `--`.
+# `luau_source.refuse_option_lookalike` is the other half: it catches the
+# mistyped flag that this setting would otherwise send to Studio as a script.
+@app.command(context_settings={"ignore_unknown_options": True})
 @handles_studio_errors
 def luau(
-    code: Optional[str] = typer.Argument(None, help="Luau source, or `-` to read it from stdin."),
+    code: Optional[str] = typer.Argument(
+        None, help="Luau source, `-` to read it from stdin, or `--` first if it starts with a dash."
+    ),
     file: Optional[Path] = typer.Option(None, "--file", help="Read Luau source from this file."),
     context: str = typer.Option(
         DEFAULT_LUAU_CONTEXT, "--context", help="Where to run it: Edit, Client or Server."
@@ -406,7 +412,12 @@ def luau(
     timeout: float = CALL_TIMEOUT_OPTION,
     as_json: bool = JSON_OPTION,
 ):
-    """Run Luau inside Studio and print what it returns."""
+    """Run Luau inside Studio and print what it returns.
+
+    Source that starts with a dash goes after `--`, since everything before it
+    is read as flags: `roblox-studio luau -- '-- a comment'`. A heredoc through
+    `-`, or `--file`, needs no such thing.
+    """
     extra_arguments = parse_arguments_option(args)
     source = read_luau_source(code, file)
 
