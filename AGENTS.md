@@ -77,7 +77,7 @@ Commands carry `@handles_studio_errors`, so the mapping applies identically whet
 .venv/bin/ruff check
 ```
 
-No Roblox needed: `tests/fake_studio_mcp_server.py` speaks the same wire protocol, selected by `FAKE_STUDIO_MODE`. One test file per module.
+No Roblox needed: `tests/fake_studio_mcp_server.py` speaks the same wire protocol, selected by `FAKE_STUDIO_MODE`. One test file per module. CI runs the same two commands on macOS against Python 3.10, 3.12 and 3.14: the ends of what `requires-python` allows plus the middle, since what differs between them is syntax and standard-library behaviour rather than this code's logic.
 
 | Mode | Simulates |
 | --- | --- |
