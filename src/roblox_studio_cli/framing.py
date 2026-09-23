@@ -160,12 +160,17 @@ def response_matches_request(message: dict, request_id: int) -> bool:
 
     Three rules, each one a frame that looked like our answer and was not:
 
-    - A frame carrying `method` is a REQUEST, never a response. MCP servers ask
-      their clients things (`roots/list`, `sampling/createMessage`,
+    - A frame carrying a string `method` is a REQUEST, never a response. MCP
+      servers ask their clients things (`roots/list`, `sampling/createMessage`,
       `elicitation/create`) and number those requests from 1 like the client's
       own counter, so one can wear the id we await. Taken as the answer it has
       no `result`: `tools/list` died with "returned a non-object result
-      (NoneType)" while the real answer sat one frame behind it.
+      (NoneType)" while the real answer sat one frame behind it. The test is
+      `isinstance(method, str)`, the same one `mcp_payloads.method_not_found_reply`
+      applies when it decides to answer: written differently, the two disagreed
+      about `"method": null`, which was then neither answered nor declined and
+      cost the caller the deadline instead. `parse_frame` refuses that frame
+      outright now, so both readings agree by construction.
     - A string id that reads as ours IS ours. JSON-RPC allows it and
       `awaited_id_pattern` above keeps such a frame, so refusing it here with
       `==` against an int burned the whole deadline against a server that had
@@ -173,7 +178,7 @@ def response_matches_request(message: dict, request_id: int) -> bool:
     - A boolean id is not the integer it equals: `True == 1`, and `"id": true`
       is the answer to nothing.
     """
-    if "method" in message:
+    if isinstance(message.get("method"), str):
         return False
     answered = message.get("id")
     if isinstance(answered, bool):
@@ -298,6 +303,19 @@ class StdoutFrameReader:
         if not isinstance(message, dict):
             logger.debug("skipping non-object JSON-RPC frame: %r", text[:NON_JSON_PREVIEW_CHARS])
             return None
+        if "method" in message and not isinstance(message["method"], str):
+            # `method` is what tells a request from a response, and JSON-RPC
+            # says it is a string. A frame with `"method": null` was read as
+            # neither: not our answer (it has a method) and not a question
+            # worth declining (the method is not a name), so it silently cost
+            # the caller their deadline.
+            raise StudioMcpProtocolError(
+                code=UNKNOWN_ERROR_CODE,
+                message=(
+                    "the proxy sent a frame whose `method` is a "
+                    f"{type(message['method']).__name__}, which is neither a request nor a response"
+                ),
+            )
         return message
 
     def frame_answers_another_request(self, line: bytes, awaited_id: int | None) -> bool:

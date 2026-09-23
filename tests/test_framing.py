@@ -24,6 +24,7 @@ from roblox_studio_cli.framing import (
     StdoutFrameReader,
     response_matches_request,
 )
+from roblox_studio_cli.mcp_payloads import method_not_found_reply
 
 AWAITED_ID = 7
 OTHER_ID = 999_999
@@ -313,3 +314,29 @@ def test_braces_inside_tool_output_are_not_structure():
     source = '{' * (MAX_FRAME_CONTAINER_DEPTH * 2) + '\\" }'
     frame = json.dumps({"id": 1, "result": {"content": source}}).encode("utf-8")
     assert StdoutFrameReader().parse_frame(frame)["result"]["content"] == source
+
+
+@pytest.mark.parametrize("method", [None, 7, ["roots/list"], {"name": "roots/list"}])
+def test_a_frame_whose_method_is_not_a_name_is_a_protocol_error(method):
+    """Neither reader claimed this frame, so it cost the caller the whole deadline.
+
+    `response_matches_request` refused it for carrying a `method` at all, and
+    `method_not_found_reply` declined to answer something whose method is not a
+    name. Between the two it was read as nothing, while wearing the id the
+    caller was waiting on. Both now apply `isinstance(method, str)`, and the
+    frame that made them disagree does not get past parsing.
+    """
+    frame = json.dumps({"jsonrpc": "2.0", "id": AWAITED_ID, "method": method}).encode("utf-8")
+    with pytest.raises(StudioMcpProtocolError, match="neither a request nor a response"):
+        StdoutFrameReader().parse_frame(frame)
+
+
+def test_the_two_readings_of_method_agree_on_every_frame_that_parses():
+    """One rule, checked from both sides: a frame is our answer or a question, never both."""
+    answer = {"jsonrpc": "2.0", "id": AWAITED_ID, "result": {}}
+    question = {"jsonrpc": "2.0", "id": AWAITED_ID, "method": "roots/list"}
+
+    assert response_matches_request(answer, AWAITED_ID) is True
+    assert method_not_found_reply(answer) is None
+    assert response_matches_request(question, AWAITED_ID) is False
+    assert method_not_found_reply(question) is not None
