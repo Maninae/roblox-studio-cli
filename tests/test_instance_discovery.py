@@ -13,8 +13,10 @@ from fake_studio_mcp_server import (
     HOSTILE_LISTER_NESTING_DEPTH,
 )
 
+from roblox_studio_cli import instance_discovery as instance_discovery_module
 from roblox_studio_cli.errors import StudioMcpTimeoutError
 from roblox_studio_cli.instance_discovery import (
+    MINIMUM_ATTACH_POLL_SECONDS,
     STUDIO_ATTACH_POLL_INTERVAL_SECONDS,
     STUDIO_ATTACH_TIMEOUT_SECONDS,
     StudioAttachOutcome,
@@ -160,6 +162,29 @@ def test_the_quoted_bridge_error_is_capped():
     assert "The bridge last answered:" in message
     assert len(message) < len(advice) + MAX_DIAGNOSTIC_TEXT_CHARS + 40
 
+class HandAdvancedClock:
+    """The `time` the attach poll sees, advanced only by its own sleeps.
+
+    Stands in for the module's `time` (it needs `monotonic` and `sleep`, and
+    nothing else), so the arithmetic in the loop is exactly what the test
+    wrote down. On the real clock the interesting cases live in a few
+    milliseconds of window, and `time.sleep` overshoots by 15 to 40 ms here, so
+    a test aimed at that band lands somewhere else one run in five.
+    """
+
+    def __init__(self, start: float = 1000.0):
+        """Start at an arbitrary epoch; only the differences matter."""
+        self.now = start
+
+    def monotonic(self) -> float:
+        """The current fake time."""
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        """Advance by exactly what was asked for, and return at once."""
+        self.now += seconds
+
+
 class NeverAttachingClient:
     """A lister that answers promptly and always says no Studio is registered.
 
@@ -269,6 +294,55 @@ def test_no_poll_is_handed_a_deadline_that_has_already_passed():
     )
 
     assert min(client.poll_timeouts) > 0, client.poll_timeouts
+
+
+def test_a_window_too_thin_to_poll_is_spent_rather_than_polled():
+    """A sliver of a window is not a poll, and spending one blamed the bridge for it.
+
+    Handed a microsecond, `call_tool` gets as far as `write_all` with its
+    deadline already gone, writes nothing, and reports "the Studio MCP proxy
+    stopped reading its input (0 of 112 bytes written)". That is a transport
+    fault named for a bridge that was answering fine, and it then rode into the
+    attach advice as the thing the bridge "last answered". Below the floor the
+    window is simply over.
+    """
+    client = NeverAttachingClient()
+
+    outcome = wait_for_studio_instances(
+        client,
+        LISTER_TOOLS,
+        timeout=GENEROUS_CALL_TIMEOUT_SECONDS,
+        attach_timeout=MINIMUM_ATTACH_POLL_SECONDS / 2,
+    )
+
+    assert not outcome.attached
+    assert client.poll_timeouts == [], "a window under the floor still bought a poll"
+    assert "stopped reading its input" not in attach_failure_message(outcome)
+
+
+def test_the_floor_applies_between_polls_and_not_only_to_the_first(monkeypatch):
+    """A window one interval plus a sliver long used to spend the sliver on a poll.
+
+    The sleep between polls is capped at what is left of the window, so it
+    usually lands on the deadline and the wait ends there. It does not when
+    more than one interval remains: the sleep takes a full 0.5 s and the next
+    pass inherits whatever the window had over that. A 0.53 s window handed
+    that pass 0.03 s, which buys nothing and reads as a transport fault.
+    """
+    clock = HandAdvancedClock()
+    monkeypatch.setattr(instance_discovery_module, "time", clock)
+    client = NeverAttachingClient()
+    sliver_window = STUDIO_ATTACH_POLL_INTERVAL_SECONDS + MINIMUM_ATTACH_POLL_SECONDS * 0.6
+
+    wait_for_studio_instances(
+        client,
+        LISTER_TOOLS,
+        timeout=GENEROUS_CALL_TIMEOUT_SECONDS,
+        attach_timeout=sliver_window,
+    )
+
+    assert client.poll_timeouts, "the lister was never polled"
+    assert min(client.poll_timeouts) >= MINIMUM_ATTACH_POLL_SECONDS, client.poll_timeouts
 
 
 def test_a_lister_that_never_answers_says_so_instead_of_blaming_the_place():

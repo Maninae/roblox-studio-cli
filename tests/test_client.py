@@ -38,6 +38,9 @@ FAKE_SERVER_PATH = Path(__file__).resolve().parent / "fake_studio_mcp_server.py"
 PNG_MAGIC_BYTES = b"\x89PNG\r\n\x1a\n"
 SILENT_SERVER_TIMEOUT_SECONDS = 2.0
 DEAF_SERVER_TIMEOUT_SECONDS = 2.0
+# A deadline already gone by the time the write is reached, which is what a
+# caller polling the last sliver of its own window hands us.
+EXPIRED_WRITE_TIMEOUT_SECONDS = 0.000001
 STUDIO_ID = "studio-1"
 STRAY_FRAME_COUNT = 6
 DECOY_ANSWER_TIMEOUT_SECONDS = 3.0
@@ -356,6 +359,24 @@ def test_a_server_that_stops_reading_its_input_times_out_instead_of_wedging(fake
             timeout=DEAF_SERVER_TIMEOUT_SECONDS,
         )
     assert time.monotonic() - started < DEAF_SERVER_TIMEOUT_SECONDS * 3, "the write outlived it"
+
+
+def test_a_write_with_no_time_left_does_not_blame_the_proxy_for_not_reading(fake_client):
+    """Nothing was offered to the pipe, so nothing is known about who is reading it.
+
+    "the Studio MCP proxy stopped reading its input (0 of 112 bytes written)"
+    is a claim about the proxy, and the bridge here is answering perfectly
+    well: what ran out was the caller's deadline, before the first `select`.
+    The attach poll used to reach this on the last sliver of its window and
+    quote the result back as what the bridge last said.
+    """
+    client = fake_client()
+
+    with pytest.raises(StudioMcpTimeoutError) as raised:
+        client.call_tool("list_roblox_studios", {}, timeout=EXPIRED_WRITE_TIMEOUT_SECONDS)
+
+    assert "no time left before the first write" in str(raised.value)
+    assert "stopped reading its input" not in str(raised.value)
 
 
 def test_a_server_request_wearing_our_id_does_not_stand_in_for_the_answer(fake_client):

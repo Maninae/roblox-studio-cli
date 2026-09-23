@@ -64,6 +64,13 @@ STUDIO_INSTANCE_LIST_KEYS = ("studios", "instances", "roblox_studios")
 # then. Earlier runs attached in 1.1 s and once took about 10 s.
 STUDIO_ATTACH_TIMEOUT_SECONDS = 12.0
 STUDIO_ATTACH_POLL_INTERVAL_SECONDS = 0.5
+# What is left of the window has to be worth a round trip, or the window is
+# spent rather than nearly spent. A poll handed a sliver of one reaches the
+# bridge with a deadline already gone, and `write_all` reports that as a proxy
+# that stopped reading its input: a transport fault quoted back for a bridge
+# that was answering fine. A real round trip over a local pipe is microseconds,
+# so 50 ms is generous, and it is invisible against a 12 s window.
+MINIMUM_ATTACH_POLL_SECONDS = 0.05
 
 
 @dataclass(frozen=True)
@@ -183,7 +190,9 @@ def wait_for_studio_instances(
     to reach Roblox Studio" error. Both mean "not yet", so both are polled
     through rather than reported. The wait is bounded by the smaller of
     `attach_timeout` and the caller's `--timeout`, so a short timeout still
-    means a short command.
+    means a short command, and by a floor at the other end: what is left of the
+    window has to be worth a round trip, or the wait ends here rather than
+    spending a request id on a deadline that is already gone.
 
     Nothing is cached between runs: a Studio can open or close between two
     commands, and instance ids do not survive a Studio restart.
@@ -197,13 +206,22 @@ def wait_for_studio_instances(
 
     while True:
         # What is left of the window, never the whole `--timeout`: given that, a
-        # poll starting just inside a 12 s window could run another 120.
-        remaining = max(deadline - time.monotonic(), 0.0)
+        # poll starting just inside a 12 s window could run another 120. Read
+        # at the TOP of each pass, after the sleep below rather than before it,
+        # because with a 1 s window and a 0.5 s interval the arithmetic lands
+        # exactly on the deadline and the poll that followed was handed nothing.
+        remaining = deadline - time.monotonic()
+        if remaining < MINIMUM_ATTACH_POLL_SECONDS:
+            return StudioAttachOutcome(
+                elapsed_seconds=time.monotonic() - started,
+                last_error_text=last_error_text,
+                window_seconds=window,
+            )
         try:
             result = client.call_tool(lister.name, {}, timeout=remaining)
         except StudioMcpTimeoutError as poll_error:
             # The poll held the rest of the window, so the window is gone, and
-            # "nothing attached in time" is what the check below already says.
+            # "nothing attached in time" is what this function already reports.
             # What it does not say is that nothing answered at all, which is a
             # different fault from a bridge that answered "no studios": quote it
             # the way an error answer is quoted, or the advice sends the reader
@@ -222,22 +240,9 @@ def wait_for_studio_instances(
                         instances, time.monotonic() - started, window_seconds=window
                     )
 
-        remaining = deadline - time.monotonic()
-        if remaining > 0:
-            time.sleep(min(STUDIO_ATTACH_POLL_INTERVAL_SECONDS, remaining))
-            # Re-read the clock AFTER the sleep: with a 1 s window and a 0.5 s
-            # interval it lands exactly on the deadline, and the poll that
-            # followed was handed nothing. A poll with no time left cannot
-            # reach the bridge at all; it spends a request id, fails inside the
-            # read loop, and logs that the lister went quiet when it was never
-            # asked.
-            if time.monotonic() < deadline:
-                continue
-        return StudioAttachOutcome(
-            elapsed_seconds=time.monotonic() - started,
-            last_error_text=last_error_text,
-            window_seconds=window,
-        )
+        sleep_seconds = min(STUDIO_ATTACH_POLL_INTERVAL_SECONDS, deadline - time.monotonic())
+        if sleep_seconds > 0:
+            time.sleep(sleep_seconds)
 
 
 def no_studio_instance_message(window_seconds: float) -> str:

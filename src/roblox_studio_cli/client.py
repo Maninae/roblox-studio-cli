@@ -383,18 +383,34 @@ class StudioMcpClient:
         larger than that buffer, whatever `--timeout` said.
 
         Raises:
-            StudioMcpTimeoutError: the proxy stopped consuming its input.
+            StudioMcpTimeoutError: the proxy stopped consuming its input, or
+                the deadline was already gone when this was called. The two are
+                separate messages on purpose: nothing offered to the pipe says
+                nothing about who is reading it.
             StudioMcpError: the pipe is closed, or the proxy exited.
         """
         remaining_payload = memoryview(payload)
+        offered_to_the_pipe = False
         while remaining_payload:
             remaining_seconds = deadline - time.monotonic()
             if remaining_seconds <= 0:
+                if not offered_to_the_pipe:
+                    # The deadline was gone before the first `select`, so
+                    # nothing was ever offered and nothing can be concluded
+                    # about who is reading. Said the other way, a caller handed
+                    # a sliver of a deadline read "the proxy stopped reading
+                    # its input (0 of 112 bytes written)" about a bridge that
+                    # was answering fine.
+                    raise StudioMcpTimeoutError(
+                        f"no time left before the first write to the Studio MCP proxy "
+                        f"({len(payload)} bytes unsent).{self.stderr_capture.stderr_suffix()}"
+                    )
                 raise StudioMcpTimeoutError(
                     f"the Studio MCP proxy stopped reading its input "
                     f"({len(payload) - len(remaining_payload)} of {len(payload)} bytes written)."
                     f"{self.stderr_capture.stderr_suffix()}"
                 )
+            offered_to_the_pipe = True
             _, writable, _ = select.select(
                 [], [self.stdin_fd], [], min(remaining_seconds, STDOUT_POLL_INTERVAL_SECONDS)
             )
