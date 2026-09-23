@@ -23,6 +23,8 @@ Orientation for anyone (human or agent) changing this repo. The README explains 
 
 Sizes are a budget, not a suggestion: `wc -l src/roblox_studio_cli/*.py` should show nothing over ~600 lines. When one grows, extract a responsibility you can name in a short phrase, not an arbitrary half. `framing.py` came out of `client.py` that way, and the seam it left is worth keeping: framing takes bytes and gives back messages, so a framing bug reproduces by calling `feed()` with a literal, and the client stays the only module that knows there is a child process.
 
+`client.py` and `discovery.py` both sit at that ceiling now, so the next change to either one extracts before it adds, and both seams are already named. Out of `client` comes the other pipe: the stderr ring buffer, the sanitised suffix an exception quotes, and the no-tools marker that tells the toggle from an ordinary silence, none of which knows a request exists. Out of `discovery` come the two halves of its own one-line summary: which TOOL to call is token matching over a `tools/list` payload, which STUDIO INSTANCE to call it on is the attach poll, the instance parser and the id resolution, and the two share nothing but the client handle.
+
 ## Invariants
 
 **Runtime discovery. Never hardcode a tool name or an argument key.** Roblox iterates on this surface; a name in a constant is a bug waiting for the next Studio release. Every lookup starts from the `tools/list` payload that this run received. Add a new convenience command by declaring a `ToolIntent` in `discovery.py` (purpose, name keywords, expected arguments), never by writing `"execute_luau"` in `main.py`.
