@@ -8,9 +8,13 @@ parsed message", which is a job with its own hazards:
   scan resumes where the last one stopped, so a chunk costs a search of its own
   bytes rather than of everything buffered so far.
 - Parsing, defensively. A frame that is not JSON is noise and is skipped; a frame
-  that is JSON-shaped but unreadable (undecodable bytes, nesting past the
-  parser's limit, an integer too long to convert) is a protocol error rather than
-  a traceback.
+  that is JSON-shaped but unreadable (undecodable bytes, an integer too long to
+  convert) is a protocol error rather than a traceback. Three things Python's
+  parser accepts and this one will not: `NaN` and `Infinity`, which are not JSON
+  and which `--json` would re-emit for a strict consumer to choke on; a literal
+  like `1e400` that overflows to infinity; and nesting past
+  `MAX_FRAME_CONTAINER_DEPTH`, because depth is free to send and expensive to
+  hold or to print.
 - Byte budgets. A cap on one frame is not a cap on memory, because parsing JSON
   multiplies size many times over, so a request carries a total parse budget as
   well, and a line that never terminates is refused outright.
@@ -29,6 +33,7 @@ reproduced by handing `feed()` some bytes.
 
 import json
 import logging
+import math
 import re
 from collections import deque
 from functools import lru_cache
@@ -59,12 +64,83 @@ FRAME_ID_PEEK_BYTES = 4096
 # must not match, so such a frame falls through to the ordinary parse path.
 FRAME_ID_PATTERN = re.compile(rb'"id"\s*:\s*([0-9]{1,18})(?![0-9])')
 NON_JSON_PREVIEW_CHARS = 200
+# How deep a frame may nest arrays and objects. Depth costs a server nothing to
+# send and costs us twice: parsing builds a Python object per level, and
+# `json.dumps(indent=2)` used to print two spaces per level per line, so 40 KB
+# nested 20,000 deep was 800 MB of `--json`. Real MCP payloads are a handful of
+# levels; 512 is far past anything Studio sends and far short of the parser's
+# own recursion limit.
+MAX_FRAME_CONTAINER_DEPTH = 512
+# Every string literal, so the depth scan counts structure and not a brace
+# inside tool output. Written as the unrolled loop (a run of ordinary
+# characters, then escape-plus-run repeated) rather than the obvious
+# `(?:[^"\\]|\\.)*`, which alternates per character: measured on an 8 MB frame
+# holding one string, 405 ms became 34 ms.
+JSON_STRING_LITERAL_PATTERN = re.compile(rb'"[^"\\]*(?:\\.[^"\\]*)*"', re.DOTALL)
+OPENING_CONTAINER_BYTES = b"[{"
+CLOSING_CONTAINER_BYTES = b"]}"
 # What an empty line costs the request's budget. Nothing is parsed or queued for
 # one, but each still costs a find, a slice and a delete, and charged nothing at
 # all a flood of them was the one hazard no bound applied to.
 EMPTY_FRAME_BUDGET_BYTES = 1
 # One pattern per in-flight request id, and ids only ever count upward.
 AWAITED_ID_PATTERN_CACHE_SIZE = 32
+
+
+def refuse_json_constant(literal: str) -> float:
+    """Refuse `NaN`, `Infinity` and `-Infinity`, which JSON does not have.
+
+    Python's parser accepts all three as an extension and its writer emits them
+    back, so one in a tool result rode through `--json` into output that a
+    strict parser refuses. The literal is one of those three words, so quoting
+    it carries nothing the server chose.
+    """
+    raise ValueError(f"a JSON-RPC frame carried {literal}, which is not JSON")
+
+
+def refuse_non_finite_number(literal: str) -> float:
+    """Parse a JSON number, refusing one that is only finite on paper.
+
+    `1e400` is legal JSON syntax and `float()` answers `inf`, which `--json`
+    then writes as `Infinity`: the same unparseable output as above, reached
+    without using a word JSON lacks.
+    """
+    value = float(literal)
+    if not math.isfinite(value):
+        raise ValueError("a JSON-RPC frame carried a number that is not finite")
+    return value
+
+
+def exceeds_container_depth(line: bytes) -> bool:
+    """True when a frame nests arrays and objects deeper than we will parse.
+
+    Three passes, cheapest first, because this runs on every frame before it is
+    parsed. Depth can never exceed the number of openers, so a count is a sound
+    way to answer "definitely not too deep" without looking at order:
+
+    1. Count openers in the raw line. That is one C-level pass (4 ms on 8 MB)
+       and it answers every ordinary frame, a 700 KB base64 capture included.
+    2. Only past that, blank the string literals and count again, so a Luau
+       source or a minified table full of braces is not read as structure.
+    3. Only past THAT, walk the remaining bytes, stopping the moment depth goes
+       over. This is the one Python-level loop here, and it is reached only by a
+       frame that really does carry hundreds of containers, where it costs a
+       fraction of the parse it is deciding against.
+    """
+    if line.count(b"[") + line.count(b"{") <= MAX_FRAME_CONTAINER_DEPTH:
+        return False
+    structure = JSON_STRING_LITERAL_PATTERN.sub(b"", line)
+    if structure.count(b"[") + structure.count(b"{") <= MAX_FRAME_CONTAINER_DEPTH:
+        return False
+    depth = 0
+    for byte in structure:
+        if byte in OPENING_CONTAINER_BYTES:
+            depth += 1
+            if depth > MAX_FRAME_CONTAINER_DEPTH:
+                return True
+        elif byte in CLOSING_CONTAINER_BYTES:
+            depth -= 1
+    return False
 
 
 @lru_cache(maxsize=AWAITED_ID_PATTERN_CACHE_SIZE)
@@ -182,12 +258,30 @@ class StdoutFrameReader:
         nested thousands deep (`RecursionError`) and an integer long enough to
         trip Python's string-to-int limit (`ValueError`).
 
+        The depth check runs BEFORE the parse, because refusing a 20,000-deep
+        frame is the point of it: parsed, it is an object per level and 800 MB
+        of `--json`. The two number hooks refuse what Python accepts and JSON
+        does not, so `NaN`, `Infinity` and `1e400` are protocol errors here
+        rather than output no strict parser will read.
+
         Raises:
             StudioMcpProtocolError: the frame is JSON-shaped but unreadable.
         """
+        if exceeds_container_depth(line):
+            raise StudioMcpProtocolError(
+                code=UNKNOWN_ERROR_CODE,
+                message=(
+                    f"the proxy sent a {len(line)} byte frame nested past "
+                    f"{MAX_FRAME_CONTAINER_DEPTH} containers; refusing to parse it"
+                ),
+            )
         text = line.decode("utf-8", errors="replace")
         try:
-            message = json.loads(text)
+            message = json.loads(
+                text,
+                parse_constant=refuse_json_constant,
+                parse_float=refuse_non_finite_number,
+            )
         except json.JSONDecodeError:
             # The proxy occasionally prints non-protocol noise on stdout; it is
             # not fatal, so log it and keep reading for real messages.

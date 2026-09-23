@@ -62,7 +62,7 @@ The two failures need different fixes, so the verdict names which one it is. `NO
 
 Shared flags:
 
-- `--json` on any subcommand prints machine-readable JSON instead of formatted text.
+- `--json` on any subcommand prints machine-readable JSON instead of formatted text: one compact line, so pipe it through `jq` to read it yourself. (Indented output grows with the payload times its nesting depth, and a server picks that depth.)
 - `--studio <id-or-name>` picks the target when several Studio windows are open. `ROBLOX_STUDIO_ID` does the same. With exactly one open, it is inferred.
 - `--timeout <seconds>` bounds a single call, and with it the wait for Studio to attach.
 - `--args '<json>'` adds or overrides arguments on any subcommand, which is the escape hatch when a Studio build wants something the flags do not cover.

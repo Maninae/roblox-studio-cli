@@ -23,7 +23,6 @@ Anything the bridge said reaches the terminal through
 """
 
 import functools
-import json
 import math
 import uuid
 from contextlib import contextmanager
@@ -65,6 +64,7 @@ from roblox_studio_cli.errors import (
     StudioRequestError,
 )
 from roblox_studio_cli.image_output import save_images
+from roblox_studio_cli.json_output import compact_json
 from roblox_studio_cli.luau_source import read_luau_source
 from roblox_studio_cli.mcp_payloads import ToolCallResult, ToolDefinition
 from roblox_studio_cli.terminal import (
@@ -219,7 +219,7 @@ def emit_result(
         raise typer.Exit(EXIT_NOT_READY)
 
     if as_json and out_path is None:
-        typer.echo(json.dumps(result.raw, indent=2))
+        typer.echo(compact_json(result.raw))
         return
 
     written = save_images(result.images, tool_name, out_path, force)
@@ -228,7 +228,7 @@ def emit_result(
             echo_server_text(image.warning, err=True)
 
     if as_json:
-        typer.echo(json.dumps(result.raw, indent=2))
+        typer.echo(compact_json(result.raw))
     else:
         if result.text:
             echo_server_text(result.text)
@@ -246,7 +246,7 @@ def emit_failed_result(result: ToolCallResult, as_json: bool) -> None:
     a fresh capture.
     """
     if as_json:
-        typer.echo(json.dumps(result.raw, indent=2))
+        typer.echo(compact_json(result.raw))
     else:
         echo_server_text(result.text or "(the tool reported a failure with no message)")
     if result.images:
@@ -307,10 +307,7 @@ def instances(timeout: float = CALL_TIMEOUT_OPTION, as_json: bool = JSON_OPTION)
 
     if as_json:
         typer.echo(
-            json.dumps(
-                [{"id": item.identifier, "name": item.name} for item in outcome.instances],
-                indent=2,
-            )
+            compact_json([{"id": item.identifier, "name": item.name} for item in outcome.instances])
         )
     else:
         for item in outcome.instances:
@@ -341,7 +338,7 @@ def tools(
             {"name": tool.name, "description": tool.description, "inputSchema": tool.input_schema}
             for tool in definitions
         ]
-        typer.echo(json.dumps(payload, indent=2))
+        typer.echo(compact_json(payload))
         return
 
     if not definitions:

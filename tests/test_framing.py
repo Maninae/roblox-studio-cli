@@ -18,6 +18,7 @@ from roblox_studio_cli import framing as framing_module
 from roblox_studio_cli.errors import StudioMcpError, StudioMcpProtocolError
 from roblox_studio_cli.framing import (
     LARGE_FRAME_BYTES,
+    MAX_FRAME_CONTAINER_DEPTH,
     MAX_MESSAGE_BYTES,
     MAX_TOOLS_LIST_TOTAL_BYTES,
     StdoutFrameReader,
@@ -254,3 +255,61 @@ def test_a_frame_carrying_a_method_is_a_question_not_our_answer(answered):
     """A JSON-RPC response never carries `method`, whatever id it wears."""
     question = {"jsonrpc": "2.0", "id": answered, "method": "roots/list"}
     assert response_matches_request(question, AWAITED_ID) is False
+
+
+@pytest.mark.parametrize(
+    "frame, reason",
+    [
+        (b'{"id": 1, "result": {"n": NaN}}', "NaN is Python's extension, not JSON"),
+        (b'{"id": 1, "result": {"n": Infinity}}', "and neither is Infinity"),
+        (b'{"id": 1, "result": {"n": -Infinity}}', "in either direction"),
+        (b'{"id": 1, "result": {"n": 1e400}}', "a literal that overflows to inf is the same bug"),
+    ],
+)
+def test_a_number_json_cannot_hold_is_a_protocol_error(frame, reason):
+    """`json.loads` accepts these and `json.dumps` writes them straight back out.
+
+    Which meant `--json` emitted `NaN` and `Infinity` for a consumer whose
+    parser refuses both, from a frame this CLI had accepted as valid. Refusing
+    them here is what lets `json_output.compact_json` promise strict JSON.
+    """
+    with pytest.raises(StudioMcpProtocolError, match="cannot read"):
+        StdoutFrameReader().parse_frame(frame)
+
+
+def test_an_ordinary_float_still_parses():
+    """The hook refuses non-finite numbers, not numbers."""
+    assert StdoutFrameReader().parse_frame(b'{"id": 1, "result": {"n": 1.5e3}}') == {
+        "id": 1,
+        "result": {"n": 1500.0},
+    }
+
+
+def test_a_frame_nested_past_the_depth_cap_is_refused_unparsed():
+    """Depth is free to send, and costs us an object per level and `--json` per line.
+
+    Measured before the cap: a 4 KB frame nested 2,000 deep printed 8 MB of
+    `--json`, and the same shape at 20,000 deep printed 800 MB, because
+    `indent=2` wrote two spaces per level on every line. Both frames sat far
+    under every byte budget here.
+    """
+    too_deep = b"[" * (MAX_FRAME_CONTAINER_DEPTH + 1) + b"]" * (MAX_FRAME_CONTAINER_DEPTH + 1)
+    with pytest.raises(StudioMcpProtocolError, match="nested past"):
+        StdoutFrameReader().parse_frame(too_deep)
+
+
+def test_nesting_up_to_the_cap_is_still_parsed():
+    at_the_cap = b"[" * MAX_FRAME_CONTAINER_DEPTH + b"]" * MAX_FRAME_CONTAINER_DEPTH
+    assert StdoutFrameReader().parse_frame(at_the_cap) is None, "a list is not a JSON-RPC frame"
+
+
+def test_braces_inside_tool_output_are_not_structure():
+    """The depth scan blanks string literals first, so Luau source cannot trip it.
+
+    A tool result holding a thousand braces (a minified table, an escaped
+    quote next to one) is an ordinary answer, and counting raw bytes would
+    have refused it.
+    """
+    source = '{' * (MAX_FRAME_CONTAINER_DEPTH * 2) + '\\" }'
+    frame = json.dumps({"id": 1, "result": {"content": source}}).encode("utf-8")
+    assert StdoutFrameReader().parse_frame(frame)["result"]["content"] == source

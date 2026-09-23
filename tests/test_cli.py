@@ -276,7 +276,7 @@ def test_screenshot_writes_the_file_even_in_json_mode(tmp_path):
     destination = tmp_path / "capture.png"
     result = invoke(["screenshot", "--out", str(destination), "--json"])
     assert result.exit_code == EXIT_OK
-    assert '"mimeType": "image/png"' in result.output
+    assert '"mimeType":"image/png"' in result.output
     assert destination.exists()
 
 
@@ -290,7 +290,7 @@ def test_json_without_out_writes_no_file_the_payload_does_not_name():
     before = temporary_captures()
     result = invoke(["screenshot", "--json"])
     assert result.exit_code == EXIT_OK, all_output(result)
-    assert '"mimeType": "image/png"' in result.output, "the payload has to be in the JSON"
+    assert '"mimeType":"image/png"' in result.output, "the payload has to be in the JSON"
     assert temporary_captures() == before, "a temp capture the JSON never names"
 
 
@@ -303,7 +303,7 @@ def test_the_advice_on_an_unwritable_result_is_a_command_that_works(tmp_path):
 
     followed = invoke(["screenshot", "--json"], mode="odd-mime")
     assert followed.exit_code == EXIT_OK, all_output(followed)
-    assert '"mimeType": "image/x-roblox-capture"' in followed.output
+    assert '"mimeType":"image/x-roblox-capture"' in followed.output
 
 
 def test_screenshot_refuses_to_overwrite_without_force(tmp_path):
@@ -437,7 +437,10 @@ def test_doctor_caps_the_fields_whose_length_the_server_chooses():
 
     assert "..." in output, "nothing was truncated"
     longest = max(len(line) for line in output.splitlines())
-    assert longest <= MAX_DIAGNOSTIC_TEXT_CHARS * 2 + len("Instances: ") + len(" ()"), longest
+    # Both capped fields, the label, the ` (name)` brackets, and the attach time
+    # the Instances row carries when the fake took a measurable moment to attach.
+    row_chrome = len("Instances: ") + len(" ()") + len(" after 12.3s")
+    assert longest <= MAX_DIAGNOSTIC_TEXT_CHARS * 2 + row_chrome, longest
     assert len(output) < 1500, "the server's own text reached the terminal at its own length"
 
 
@@ -658,3 +661,20 @@ def test_wake_display_off_macos_warns_and_still_captures(tmp_path, monkeypatch):
     assert destination.exists()
     assert "not macOS" in all_output(result)
     assert launched == [], "caffeinate was launched off macOS"
+
+
+def test_json_output_is_one_compact_line():
+    """`indent=2` is quadratic in nesting depth, and the depth is the server's choice.
+
+    A 4 KB frame nested 2,000 deep printed 8 MB of `--json`, and the same shape
+    at 20,000 deep printed 800 MB: two spaces per level, on every line. Compact
+    separators make the output the size of the payload, and `jq` is there for
+    anyone who wants it indented.
+    """
+    result = invoke(["doctor", "--json"])
+    assert result.exit_code == EXIT_OK, all_output(result)
+    payload = result.output.strip()
+
+    assert "\n" not in payload, "the payload is indented, so its size grows with its depth"
+    assert '"ok":true' in payload
+    assert json.loads(payload)["tool_count"] == 6

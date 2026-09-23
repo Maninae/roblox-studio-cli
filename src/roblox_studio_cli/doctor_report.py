@@ -15,7 +15,6 @@ answer; the remediation goes to stderr so a script can read the verdict without
 parsing advice.
 """
 
-import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -33,6 +32,7 @@ from roblox_studio_cli.discovery import (
     wait_for_studio_instances,
 )
 from roblox_studio_cli.errors import StudioMcpError, StudioNotConnectedError
+from roblox_studio_cli.json_output import compact_json
 from roblox_studio_cli.terminal import (
     echo_server_text,
     sanitize_diagnostic_line,
@@ -131,7 +131,7 @@ def gather_doctor_report(timeout: float) -> DoctorReport:
 def render_doctor_report(report: DoctorReport, as_json: bool) -> None:
     """Print the report as aligned text, or as its `--json` dict."""
     if as_json:
-        typer.echo(json.dumps(report.as_dict(), indent=2))
+        typer.echo(compact_json(report.as_dict()))
         return
 
     width = DOCTOR_LABEL_COLUMN_WIDTH
