@@ -11,6 +11,7 @@ too long to convert, and large frames answering a request nobody sent.
 """
 
 import json
+import time
 
 import pytest
 
@@ -22,6 +23,7 @@ from roblox_studio_cli.framing import (
     MAX_MESSAGE_BYTES,
     MAX_TOOLS_LIST_TOTAL_BYTES,
     StdoutFrameReader,
+    exceeds_container_depth,
     response_matches_request,
 )
 from roblox_studio_cli.mcp_payloads import method_not_found_reply
@@ -29,6 +31,11 @@ from roblox_studio_cli.mcp_payloads import method_not_found_reply
 AWAITED_ID = 7
 OTHER_ID = 999_999
 PADDING_BYTES = LARGE_FRAME_BYTES * 3
+# What the depth scan may spend on a frame built to make it spend. Both are
+# orders of magnitude over the real cost (about 1 ms and 40 ms here), because
+# the failure they guard against is measured in minutes and CI is shared.
+HOSTILE_FRAME_SECONDS = 1.0
+LARGE_HOSTILE_FRAME_SECONDS = 2.0
 
 
 def drain(reader: StdoutFrameReader) -> list[dict]:
@@ -62,6 +69,87 @@ def frame_quoting_another_id_first(own_id) -> bytes:
         "id": own_id,
     }
     return json.dumps(body).encode("utf-8") + b"\n"
+
+
+def unterminated_string_frame(total_bytes: int) -> bytes:
+    """Open a string, pad it with escaped quotes, never close it, then over-open.
+
+    The tail is one container past the cap, so the cheap opener count cannot
+    clear the frame and the scan has to walk it. Everything before that tail
+    sits inside a string with no end, which is the shape the old blanking regex
+    backtracked over: one candidate start, an escaped quote at every position
+    after it, and no closing quote to ever stop the search.
+    """
+    openers = b"{" * (MAX_FRAME_CONTAINER_DEPTH + 1)
+    escaped_quotes = (total_bytes - len(openers) - 1) // 2
+    return b'"' + rb"\"" * escaped_quotes + openers
+
+
+@pytest.mark.parametrize(
+    ("frame_bytes", "budget_seconds"),
+    [
+        (128 * 1024, HOSTILE_FRAME_SECONDS),
+        (4 * 2**20, LARGE_HOSTILE_FRAME_SECONDS),
+    ],
+)
+def test_an_unterminated_string_costs_time_linear_in_its_length(frame_bytes, budget_seconds):
+    """The depth check runs where no timeout can reach it, so it has to be linear.
+
+    Measured against the regex this replaced, on exactly this frame: 2.9 s at
+    32 KB, 42 s at the 128 KB below, quadratic from there, and an 8 MB frame
+    outliving the caller. `parse_frame` runs inside the read loop, so none of
+    that was a slow command: `tools --timeout 3` ran for 85 seconds.
+    """
+    line = unterminated_string_frame(frame_bytes)
+
+    started = time.perf_counter()
+    verdict = exceeds_container_depth(line)
+    elapsed = time.perf_counter() - started
+
+    assert elapsed < budget_seconds, f"{len(line)} bytes took {elapsed:.1f}s"
+    assert verdict is False, "the openers are inside the string, so this frame nests nothing"
+
+
+def test_an_unterminated_string_is_noise_rather_than_a_depth_error():
+    """It is not valid JSON, so it is skipped the way any other garbage line is."""
+    assert StdoutFrameReader().parse_frame(unterminated_string_frame(4096)) is None
+
+
+def test_the_cap_is_the_last_depth_accepted_and_openers_in_a_string_do_not_count():
+    """512 containers parse and 513 do not, whatever the string literals hold.
+
+    Both frames carry the same opener bytes, so the cheap count cannot tell them
+    apart and the walk has to: what differs is which side of the quotes they are
+    on, and that the walk leaves the string it entered.
+    """
+    decoys = b'"' + b"{" * MAX_FRAME_CONTAINER_DEPTH + b'"'
+
+    assert exceeds_container_depth(decoys + b"[" * MAX_FRAME_CONTAINER_DEPTH) is False
+    assert exceeds_container_depth(decoys + b"[" * (MAX_FRAME_CONTAINER_DEPTH + 1)) is True
+
+
+def test_closers_with_nothing_open_do_not_bank_credit_against_later_nesting():
+    """Depth stops at zero on the way down, or a tail of closers buys nesting.
+
+    Allowed to go negative, 600 closers ahead of 513 openers read as depth -87:
+    exactly the frame the cap exists for, waved through.
+    """
+    assert exceeds_container_depth(b"}" * 600 + b"{" * (MAX_FRAME_CONTAINER_DEPTH + 1)) is True
+
+
+def test_a_run_of_backslashes_decides_whether_the_quote_after_it_closes_the_string():
+    """Four escaped backslashes end with the string still open; a fifth escapes the quote.
+
+    Tracking "the previous byte was a backslash" is what gets a run right.
+    Asking whether a backslash merely appears before the quote reads the first
+    frame as still inside its string and lets 513 real containers through.
+    """
+    run = b"\\\\" * 4
+    closed = b'"' + run + b'"' + b"{" * (MAX_FRAME_CONTAINER_DEPTH + 1)
+    still_open = b'"' + run + b'\\"' + b"{" * (MAX_FRAME_CONTAINER_DEPTH + 1)
+
+    assert exceeds_container_depth(closed) is True
+    assert exceeds_container_depth(still_open) is False
 
 
 def test_two_frames_in_one_chunk_both_arrive():

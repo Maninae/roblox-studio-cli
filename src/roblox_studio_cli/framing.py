@@ -71,14 +71,12 @@ NON_JSON_PREVIEW_CHARS = 200
 # levels; 512 is far past anything Studio sends and far short of the parser's
 # own recursion limit.
 MAX_FRAME_CONTAINER_DEPTH = 512
-# Every string literal, so the depth scan counts structure and not a brace
-# inside tool output. Written as the unrolled loop (a run of ordinary
-# characters, then escape-plus-run repeated) rather than the obvious
-# `(?:[^"\\]|\\.)*`, which alternates per character: measured on an 8 MB frame
-# holding one string, 405 ms became 34 ms.
-JSON_STRING_LITERAL_PATTERN = re.compile(rb'"[^"\\]*(?:\\.[^"\\]*)*"', re.DOTALL)
 OPENING_CONTAINER_BYTES = b"[{"
 CLOSING_CONTAINER_BYTES = b"]}"
+# The two bytes that drive the depth scan's string state: a quote opens or ends
+# a string literal, and a backslash inside one spends the byte after it.
+STRING_QUOTE_BYTE = ord('"')
+STRING_ESCAPE_BYTE = ord("\\")
 # What an empty line costs the request's budget. Nothing is parsed or queued for
 # one, but each still costs a find, a slice and a delete, and charged nothing at
 # all a flood of them was the one hazard no bound applied to.
@@ -114,32 +112,53 @@ def refuse_non_finite_number(literal: str) -> float:
 def exceeds_container_depth(line: bytes) -> bool:
     """True when a frame nests arrays and objects deeper than we will parse.
 
-    Three passes, cheapest first, because this runs on every frame before it is
-    parsed. Depth can never exceed the number of openers, so a count is a sound
-    way to answer "definitely not too deep" without looking at order:
+    Two passes, and the first answers every ordinary frame. Depth can never
+    exceed the number of openers, so counting them is a sound way to say
+    "definitely not too deep" without looking at order at all: that is one
+    C-level pass (4 ms on 8 MB) and it clears a 700 KB base64 capture.
 
-    1. Count openers in the raw line. That is one C-level pass (4 ms on 8 MB)
-       and it answers every ordinary frame, a 700 KB base64 capture included.
-    2. Only past that, blank the string literals and count again, so a Luau
-       source or a minified table full of braces is not read as structure.
-    3. Only past THAT, walk the remaining bytes, stopping the moment depth goes
-       over. This is the one Python-level loop here, and it is reached only by a
-       frame that really does carry hundreds of containers, where it costs a
-       fraction of the parse it is deciding against.
+    Past that, one walk of the bytes, tracking three things as it goes: whether
+    we are inside a string literal, because a brace in Luau source or a minified
+    table is text and not structure; whether the byte before was a backslash
+    spending this one; and the depth itself, which ends the walk the moment it
+    passes the cap. A closer with nothing open leaves the depth at zero rather
+    than taking it negative, so unbalanced tails cannot bank credit against
+    nesting that comes later.
+
+    The walk reads strings exactly as JSON does, so it can only disagree with
+    the parser about a frame the parser refuses anyway: an unterminated string
+    swallows whatever follows it here, and fails at the first C-level pass of
+    `json.loads` there.
+
+    One scan and no regex is the point. This was three passes, the middle one
+    blanking string literals with `"[^"\\]*(?:\\.[^"\\]*)*"`. A frame that opens
+    a string, pads it with escaped quotes and never closes it backtracks that
+    pattern quadratically: 128 KB of it took 42 s, and an 8 MB frame would
+    outlive the caller, all inside `parse_frame` where `--timeout` cannot reach.
     """
     if line.count(b"[") + line.count(b"{") <= MAX_FRAME_CONTAINER_DEPTH:
         return False
-    structure = JSON_STRING_LITERAL_PATTERN.sub(b"", line)
-    if structure.count(b"[") + structure.count(b"{") <= MAX_FRAME_CONTAINER_DEPTH:
-        return False
     depth = 0
-    for byte in structure:
-        if byte in OPENING_CONTAINER_BYTES:
+    inside_string = False
+    after_escape = False
+    for byte in line:
+        if inside_string:
+            if after_escape:
+                after_escape = False
+            elif byte == STRING_ESCAPE_BYTE:
+                after_escape = True
+            elif byte == STRING_QUOTE_BYTE:
+                inside_string = False
+            continue
+        if byte == STRING_QUOTE_BYTE:
+            inside_string = True
+        elif byte in OPENING_CONTAINER_BYTES:
             depth += 1
             if depth > MAX_FRAME_CONTAINER_DEPTH:
                 return True
         elif byte in CLOSING_CONTAINER_BYTES:
-            depth -= 1
+            if depth:
+                depth -= 1
     return False
 
 
