@@ -87,7 +87,7 @@ No Roblox needed: `tests/fake_studio_mcp_server.py` speaks the same wire protoco
 | `noisy-stderr` | A 200 KB stderr line before answering, then an ordinary line. |
 | `malformed` | A non-object stdout frame, a numeric tool name, an `error` member that is a bare string. |
 | `hostile-names` | A tool whose name, description and argument key carry newlines, an OSC escape and invisible Unicode. |
-| `giant-names` | A server that names itself, and its instance, in 100 KB of clean text. |
+| `giant-names` | A server that names itself, its instance, a tool and one of that tool's arguments in 100 KB of clean text, with forty arguments besides. |
 | `crowded` | Forty extra tools and forty registered instances, so every enumeration has to stop somewhere. |
 | `invalid-utf8` | A stdout line that is not decodable UTF-8, then a normal answer. |
 | `stray-flood` | Several 200 KB frames carrying a request id nobody awaits, ahead of the real one. |
@@ -96,6 +96,10 @@ No Roblox needed: `tests/fake_studio_mcp_server.py` speaks the same wire protoco
 | `deaf-stdin` | Answers the handshake, then never reads stdin again, so a large request fills the pipe. |
 | `capture-silent` | Everything works except the capture, which is accepted and never answered. |
 | `capture-error` | The capture comes back `isError` with an image attached. |
+| `odd-mime` | The capture is an image type no extension fits, so the bytes exist and the file cannot. |
+| `odd-serverinfo` | The handshake names the server with a bare string where the spec has an object. |
+| `lone-surrogate` | A `\udcff` in the server name, the instance name and a tool result: legal JSON, unencodable as UTF-8. |
+| `string-ids` | Every response echoes the request id as a string, which JSON-RPC allows. |
 
 Against real Studio, the end-to-end check is `roblox-studio doctor`, then `state`, then `luau 'return game.Name'`, then `screenshot --wake-display`. Expect about three seconds per command: that is Studio attaching, not the CLI being slow. A capture against a sleeping display never answers at all, which is what `--wake-display` is for.
 
