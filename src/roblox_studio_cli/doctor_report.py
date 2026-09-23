@@ -24,6 +24,7 @@ from roblox_studio_cli.client import (
     STUDIO_MCP_BINARY_ENV_VAR,
     STUDIO_NOT_ENABLED_MESSAGE,
     StudioMcpClient,
+    handshake_timeout,
     resolve_studio_binary_path,
 )
 from roblox_studio_cli.errors import StudioMcpError, StudioNotConnectedError
@@ -102,7 +103,9 @@ def gather_doctor_report(timeout: float) -> DoctorReport:
 
     client = StudioMcpClient()
     try:
-        handshake = client.start()
+        # Bounded like every other command's handshake: `doctor --timeout 1`
+        # must not spend fifteen seconds on a proxy that never answers it.
+        handshake = client.start(timeout=handshake_timeout(timeout))
         # Kept exactly as sent, including the shapes that are not an object:
         # `handshake_row` is where reading it safely belongs, and `--json` wants
         # what the server really answered.

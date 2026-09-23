@@ -35,6 +35,8 @@ from roblox_studio_cli.client import (
     DEFAULT_CALL_TOOL_TIMEOUT_SECONDS,
     DEFAULT_LIST_TOOLS_TIMEOUT_SECONDS,
     StudioMcpClient,
+    handshake_timeout,
+    tools_list_timeout,
 )
 from roblox_studio_cli.display_wake import DISPLAY_ASLEEP_HINT, display_kept_awake
 from roblox_studio_cli.doctor_report import gather_doctor_report, render_doctor_report
@@ -175,14 +177,18 @@ def handles_studio_errors(command):
 
 
 @contextmanager
-def studio_client():
-    """Open a started client and guarantee the proxy is reaped afterwards.
+def studio_client(timeout: float):
+    """Open a started client, bounding the handshake by the caller's `--timeout`.
 
-    Failures propagate to `handles_studio_errors`, which owns the exit code.
+    That number is a promise about the command, so it reaches every exchange
+    the command makes and not only the last one: on `start()`'s own default, a
+    proxy that accepts `initialize` and never answers it held `luau --timeout 1`
+    for 18.1 s. The proxy is reaped whatever happens, and failures propagate to
+    `handles_studio_errors`, which owns the exit code.
     """
     client = StudioMcpClient()
     try:
-        client.start()
+        client.start(timeout=handshake_timeout(timeout))
         yield client
     finally:
         client.close()
@@ -310,8 +316,8 @@ def doctor(
 @handles_studio_errors
 def instances(timeout: float = CALL_TIMEOUT_OPTION, as_json: bool = JSON_OPTION):
     """List the Roblox Studio instances registered with the MCP bridge."""
-    with studio_client() as client:
-        definitions = client.list_tools()
+    with studio_client(timeout) as client:
+        definitions = client.list_tools(timeout=tools_list_timeout(timeout))
         outcome = wait_for_studio_instances(client, definitions, timeout=timeout)
 
     if as_json:
@@ -339,7 +345,7 @@ def tools(
     as_json: bool = JSON_OPTION,
 ):
     """List the tools Studio exposes, with their argument names."""
-    with studio_client() as client:
+    with studio_client(timeout) as client:
         definitions = client.list_tools(timeout=timeout)
 
     if as_json:
@@ -388,8 +394,8 @@ def call(
 ):
     """Call any tool by name. The escape hatch when no convenience command fits."""
     arguments = parse_arguments_option(args)
-    with studio_client() as client:
-        definitions = client.list_tools()
+    with studio_client(timeout) as client:
+        definitions = client.list_tools(timeout=tools_list_timeout(timeout))
         definition = next((entry for entry in definitions if entry.name == tool), None)
         if definition is None:
             # Server-chosen names, so the list is capped: the point of the
@@ -430,8 +436,8 @@ def luau(
     extra_arguments = parse_arguments_option(args)
     source = read_luau_source(code, file)
 
-    with studio_client() as client:
-        definitions = client.list_tools()
+    with studio_client(timeout) as client:
+        definitions = client.list_tools(timeout=tools_list_timeout(timeout))
         match = find_tool(definitions, LUAU_INTENT)
 
         code_argument = find_argument_name(
@@ -490,8 +496,8 @@ def screenshot(
         with display_kept_awake(wake_display, timeout) as warning:
             if warning:
                 typer.echo(warning, err=True)
-            with studio_client() as client:
-                definitions = client.list_tools()
+            with studio_client(timeout) as client:
+                definitions = client.list_tools(timeout=tools_list_timeout(timeout))
                 match = find_tool(definitions, SCREENSHOT_INTENT)
                 # Studio requires a caller-supplied capture id that nobody could
                 # guess, so generate one rather than making every invocation
@@ -522,8 +528,8 @@ def state(
 ):
     """Report Studio's current state (mode, available data models, focused data model)."""
     arguments = parse_arguments_option(args)
-    with studio_client() as client:
-        definitions = client.list_tools()
+    with studio_client(timeout) as client:
+        definitions = client.list_tools(timeout=tools_list_timeout(timeout))
         match = find_tool(definitions, STUDIO_STATE_INTENT)
         result = call_discovered_tool(client, definitions, match.tool, arguments, studio, timeout)
 
@@ -546,8 +552,8 @@ def play(
         raise typer.Exit(EXIT_REQUEST_ERROR)
 
     arguments = parse_arguments_option(args)
-    with studio_client() as client:
-        definitions = client.list_tools()
+    with studio_client(timeout) as client:
+        definitions = client.list_tools(timeout=tools_list_timeout(timeout))
         match = find_tool(definitions, PLAY_INTENT)
         start_argument = find_argument_name(
             match.tool, PLAY_START_ARGUMENT_NAMES, fall_back_to_required=False

@@ -64,7 +64,7 @@ Shared flags:
 
 - `--json` on any subcommand prints machine-readable JSON instead of formatted text: one compact line, so pipe it through `jq` to read it yourself. (Indented output grows with the payload times its nesting depth, and a server picks that depth.)
 - `--studio <id-or-name>` picks the target when several Studio windows are open. `ROBLOX_STUDIO_ID` does the same. With exactly one open, it is inferred.
-- `--timeout <seconds>` bounds a single call, and with it the wait for Studio to attach.
+- `--timeout <seconds>` bounds every exchange the command makes, not just the tool call: the MCP handshake, `tools/list`, the wait for Studio to attach, and the call itself. It only ever shortens a wait, so the defaults still apply when you ask for longer. (`doctor` and `tools` are the two whose `--timeout` IS the `tools/list` wait rather than a cap on it.)
 - `--args '<json>'` adds or overrides arguments on any subcommand, which is the escape hatch when a Studio build wants something the flags do not cover.
 - `--out <path>` plus `--force` on `screenshot` and `call`, for tools that return images. `--out` is the request for a file, so it is honoured in both output modes; `--json` with no `--out` writes nothing, because the payload is already in the JSON.
 

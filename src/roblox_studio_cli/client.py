@@ -106,6 +106,30 @@ STUDIO_NOT_ENABLED_MESSAGE = (
 )
 
 
+def handshake_timeout(caller_timeout: float) -> float:
+    """The handshake's bound when a caller named one: the smaller of the two.
+
+    `--timeout` is a promise about the command, so it has to reach the exchanges
+    that happen BEFORE the tool call. Left on this module's default, a proxy
+    that accepts `initialize` and never answers it held `luau --timeout 1` for
+    18.1 s. It only ever shortens the wait: a caller asking for five minutes of
+    tool time is not asking for five minutes of handshake.
+    """
+    return min(caller_timeout, DEFAULT_INITIALIZE_TIMEOUT_SECONDS)
+
+
+def tools_list_timeout(caller_timeout: float) -> float:
+    """The same rule for `tools/list`, which every convenience command runs first.
+
+    Measured against a proxy that answers the handshake and then never answers
+    `tools/list` (Studio with its MCP toggle off): `luau 'return 1' --timeout 1`
+    took 30.3 s on this module's default. `doctor` and `tools` pass their own
+    `--timeout` straight through instead, because for those two the number the
+    caller typed IS the tools/list wait rather than a cap on it.
+    """
+    return min(caller_timeout, DEFAULT_LIST_TOOLS_TIMEOUT_SECONDS)
+
+
 def resolve_studio_binary_path() -> str:
     """Path to the Studio MCP proxy binary.
 

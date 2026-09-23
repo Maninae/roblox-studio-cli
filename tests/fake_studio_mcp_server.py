@@ -50,6 +50,10 @@ What the pipe is doing (the transport's own hazards):
     huge-list      a tools/list answer larger than the whole-list byte budget
     deaf-stdin     answers the handshake, then never reads its stdin again, so a
                    large request fills the pipe buffer and a blocking write hangs
+    handshake-silent
+                   reads `initialize` and never answers it, the way a wedged
+                   proxy looks from the client's side: nothing the CLI does
+                   afterwards happens, so `--timeout` is all that ends it
     capture-silent everything works except the capture, which is accepted and
                    never answered: what Studio does with the display asleep
     capture-error  the capture comes back isError, with an image attached: a
@@ -612,6 +616,12 @@ def handle_request(message: dict, mode: str) -> None:
 def main() -> None:
     """Read requests until stdin closes, answering according to the selected mode."""
     mode = os.environ.get("FAKE_STUDIO_MODE", "connected")
+    if mode == "handshake-silent":
+        # Take the handshake and never answer it. Every later exchange is
+        # unreachable, so only the client's own deadline can end the command.
+        sys.stdin.readline()
+        time.sleep(DEAF_SLEEP_SECONDS)
+        return
     if mode == "deaf-stdin":
         # Answer the handshake, then stop reading. The client's next large write
         # fills the pipe buffer and has nowhere to go.

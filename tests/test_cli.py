@@ -13,6 +13,7 @@ import ast
 import json
 import os
 import tempfile
+import time
 from pathlib import Path
 
 import pytest
@@ -21,6 +22,11 @@ from typer.testing import CliRunner
 
 from roblox_studio_cli import display_wake as display_wake_module
 from roblox_studio_cli import main as main_module
+from roblox_studio_cli.client import (
+    DEFAULT_INITIALIZE_TIMEOUT_SECONDS,
+    DEFAULT_LIST_TOOLS_TIMEOUT_SECONDS,
+    StudioMcpClient,
+)
 from roblox_studio_cli.luau_source import MAX_LUAU_SOURCE_BYTES
 from roblox_studio_cli.main import (
     EXIT_NOT_READY,
@@ -35,6 +41,26 @@ PNG_MAGIC_BYTES = b"\x89PNG\r\n\x1a\n"
 # Short enough to keep the suite quick: the attach wait is bounded by --timeout.
 SHORT_TIMEOUT = "1"
 SILENT_SERVER_TIMEOUT = "2"
+# What a `--timeout 1` command may spend end to end, generously. The real cost
+# is the second it asked for plus the shutdown grace a wedged proxy makes the
+# client pay for reaping it: measured, 1.3 s against a silent `tools/list` and
+# 4.2 s against a silent handshake. The regressions below are 30.3 s and 18.1 s,
+# so there is room for a loaded runner without the assertion going quiet.
+BOUNDED_COMMAND_SECONDS = 10.0
+# Stands in for a path only the test knows, since the table is built at import.
+OUT_PLACEHOLDER = "<out>"
+# Every command that opens a client, so every `studio_client()` and every
+# `list_tools()` call site is covered: the bug was one site at a time.
+TIMEOUT_BOUNDED_COMMANDS = {
+    "doctor": ["doctor"],
+    "instances": ["instances"],
+    "tools": ["tools"],
+    "call": ["call", "execute_luau", "--args", '{"code": "return 1", "datamodel_type": "Edit"}'],
+    "luau": ["luau", "return 1"],
+    "screenshot": ["screenshot", "--out", OUT_PLACEHOLDER],
+    "state": ["state"],
+    "play": ["play", "--start"],
+}
 
 runner = CliRunner()
 
@@ -169,6 +195,77 @@ def test_tools_without_the_toggle_exits_not_ready():
     result = invoke(["tools", "--timeout", SILENT_SERVER_TIMEOUT], mode="no-tools")
     assert result.exit_code == EXIT_NOT_READY
     assert "Enable Studio as MCP server" in all_output(result)
+
+
+def test_a_silent_tools_list_cannot_outlive_the_timeout():
+    """`--timeout` is a promise about the command, not only about its last exchange.
+
+    With Studio's MCP toggle off the proxy answers the handshake and then never
+    answers `tools/list`, which every convenience command runs first. That call
+    kept its own 30 s default whatever the caller asked for: measured before the
+    fix, `luau 'return 1' --timeout 1` took 30.3 s.
+    """
+    started = time.monotonic()
+    result = invoke(["luau", "return 1", "--timeout", SHORT_TIMEOUT], mode="no-tools")
+    elapsed = time.monotonic() - started
+
+    assert result.exit_code == EXIT_NOT_READY, all_output(result)
+    assert "Enable Studio as MCP server" in all_output(result)
+    assert elapsed < BOUNDED_COMMAND_SECONDS, f"--timeout 1 ran for {elapsed:.1f}s"
+
+
+def test_a_handshake_that_is_never_answered_cannot_outlive_the_timeout():
+    """The same promise, one exchange earlier: a proxy that takes `initialize` and stops.
+
+    `start()` had a 15 s default of its own and no caller ever narrowed it, so
+    `luau 'return 1' --timeout 1` took 18.1 s here. What is left is the second
+    the caller asked for plus the grace the client spends reaping a child that
+    ignores stdin EOF.
+    """
+    started = time.monotonic()
+    result = invoke(["luau", "return 1", "--timeout", SHORT_TIMEOUT], mode="handshake-silent")
+    elapsed = time.monotonic() - started
+
+    assert result.exit_code == EXIT_NOT_READY, all_output(result)
+    assert "no response to 'initialize'" in all_output(result)
+    assert elapsed < BOUNDED_COMMAND_SECONDS, f"--timeout 1 ran for {elapsed:.1f}s"
+
+
+@pytest.mark.parametrize("command", sorted(TIMEOUT_BOUNDED_COMMANDS))
+def test_every_command_hands_its_timeout_to_the_handshake_and_the_listing(
+    monkeypatch, tmp_path, command
+):
+    """The enumeration behind the two wall-clock tests above.
+
+    Those prove the bound on one command against a silent proxy; this one reads
+    the number each command actually handed the two calls, because the fault was
+    per call site and a new command is one `client.list_tools()` away from
+    reintroducing it.
+    """
+    handed: list[tuple[str, float]] = []
+    original_start = StudioMcpClient.start
+    original_list_tools = StudioMcpClient.list_tools
+
+    def record_start(self, timeout=DEFAULT_INITIALIZE_TIMEOUT_SECONDS):
+        handed.append(("start", timeout))
+        return original_start(self, timeout)
+
+    def record_list_tools(self, timeout=DEFAULT_LIST_TOOLS_TIMEOUT_SECONDS):
+        handed.append(("list_tools", timeout))
+        return original_list_tools(self, timeout)
+
+    monkeypatch.setattr(StudioMcpClient, "start", record_start)
+    monkeypatch.setattr(StudioMcpClient, "list_tools", record_list_tools)
+    arguments = [
+        part.replace(OUT_PLACEHOLDER, str(tmp_path / "capture.png"))
+        for part in TIMEOUT_BOUNDED_COMMANDS[command]
+    ]
+
+    result = invoke([*arguments, "--timeout", SHORT_TIMEOUT])
+
+    assert result.exit_code == EXIT_OK, all_output(result)
+    assert [name for name, _ in handed] == ["start", "list_tools"], handed
+    assert all(seconds <= float(SHORT_TIMEOUT) for _, seconds in handed), handed
 
 
 def test_instances_lists_the_registered_studio():
