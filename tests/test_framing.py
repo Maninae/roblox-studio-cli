@@ -52,6 +52,9 @@ LARGE_HOSTILE_FRAME_SECONDS = 2.0
 # 4 MB of padding still walks in 0.098 s against the 1.0 s above, so the test
 # passed on the code it exists to fail. Measured here: 48x to 77x.
 MIN_TRIM_SPEEDUP = 10
+# A number literal long enough that anything worse than linear would show. The
+# measured cost is about 7 ms either way, against the one-second budget below.
+HOSTILE_NUMBER_DIGITS = 4_000_000
 
 
 def drain(reader: StdoutFrameReader) -> list[dict]:
@@ -288,6 +291,27 @@ def test_a_frame_padded_with_whitespace_stays_as_cheap_as_a_newline_flood():
         f"{len(frame)} bytes of padding took {elapsed * 1000:.0f} ms, against "
         f"{unbounded * 1000:.0f} ms walked unbounded: the bound is not being hit"
     )
+
+
+def test_a_number_literal_of_millions_of_digits_parses_in_linear_time():
+    """The docstring says numbers need no bound of their own; this is why.
+
+    Both hooks run per literal and both are linear in its digits, so the pair
+    of frames here cost about 7 ms each: the float goes through `parse_float`
+    and comes back finite, and the integer trips Python's 4300-digit
+    conversion limit, which is refused as a frame this build cannot read. The
+    budget is a hundredfold either way, so what this fails is a future prescan
+    that walks a literal more than once, not a slow afternoon on CI.
+    """
+    digits = b"9" * HOSTILE_NUMBER_DIGITS
+    reader = StdoutFrameReader()
+
+    with wall_clock_budget(HOSTILE_FRAME_SECONDS, "parsing a giant float literal"):
+        assert reader.parse_frame(b'{"id": 1, "result": {"n": 1.' + digits + b"}}")
+
+    with wall_clock_budget(HOSTILE_FRAME_SECONDS, "parsing a giant integer literal"):
+        with pytest.raises(StudioMcpProtocolError, match="cannot read"):
+            reader.parse_frame(b'{"id": 1, "result": {"n": ' + digits + b"}}")
 
 
 def test_an_unterminated_string_is_noise_rather_than_a_depth_error():

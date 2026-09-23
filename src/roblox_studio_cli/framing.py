@@ -14,7 +14,10 @@ parsed message", which is a job with its own hazards:
   and which `--json` would re-emit for a strict consumer to choke on; a literal
   like `1e400` that overflows to infinity; and nesting past
   `MAX_FRAME_CONTAINER_DEPTH`, because depth is free to send and expensive to
-  hold or to print.
+  hold or to print. Length INSIDE a number is not a hazard of its own and needs
+  no bound: a literal parses in time linear in its digits, measured here at 4 M
+  of them in about 7 ms, whether it reaches `parse_float` or the integer
+  conversion limit that refuses it.
 - Byte budgets. A cap on one frame is not a cap on memory, because parsing JSON
   multiplies size many times over, so a request carries a total parse budget as
   well, and a line that never terminates is refused outright.
