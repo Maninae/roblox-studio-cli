@@ -257,7 +257,12 @@ class StdoutFrameReader:
             if newline_index < 0:
                 self.scan_position = len(self.buffer)
                 return
-            line = bytes(self.buffer[:newline_index]).strip()
+            # One copy of the frame, not two. Slicing the bytearray builds a
+            # bytearray copy that `bytes()` then copies again, and a frame the
+            # id peek is about to drop unparsed paid for both: 3.1x its own
+            # length in peak allocation, against 2.1x through a memoryview.
+            with memoryview(self.buffer) as buffered:
+                line = bytes(buffered[:newline_index]).strip()
             del self.buffer[: newline_index + 1]
             self.scan_position = 0
             if not line:

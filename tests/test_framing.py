@@ -13,6 +13,7 @@ too long to convert, and large frames answering a request nobody sent.
 import json
 import signal
 import time
+import tracemalloc
 from contextlib import contextmanager
 
 import pytest
@@ -33,6 +34,14 @@ from roblox_studio_cli.mcp_payloads import method_not_found_reply
 AWAITED_ID = 7
 OTHER_ID = 999_999
 PADDING_BYTES = LARGE_FRAME_BYTES * 3
+# What the client hands `feed()` per read, mirrored here because a frame arrives
+# in pipe-sized pieces and the buffer's growth is part of what a frame costs.
+STDOUT_CHUNK_BYTES = 65536
+# Peak allocation a frame may cost, as a multiple of its own length. The floor
+# is 2x: the buffer holds it, and the line is taken out of the buffer. Measured
+# from 128 KB to 8 MB: 3.1x when the bytearray was sliced before `bytes()`
+# copied it again, 2.1x through a memoryview.
+MAX_PEAK_BYTES_PER_FRAME = 2.5
 # What the depth scan may spend on a frame built to make it spend. Both are
 # orders of magnitude over the real cost (about 1 ms and 40 ms here), because
 # the failure they guard against is measured in minutes and CI is shared.
@@ -141,6 +150,40 @@ def test_an_unterminated_string_costs_time_linear_in_its_length(frame_bytes, bud
 
     assert elapsed < budget_seconds, f"{len(line)} bytes took {elapsed:.1f}s"
     assert verdict is False, "the openers are inside the string, so this frame nests nothing"
+
+
+def peak_bytes_feeding(frame: bytes) -> int:
+    """Peak traced allocation while one frame arrives in pipe-sized reads."""
+    reader = StdoutFrameReader()
+    reader.begin_request(MAX_TOOLS_LIST_TOTAL_BYTES)
+    tracemalloc.start()
+    try:
+        tracemalloc.reset_peak()
+        for start in range(0, len(frame), STDOUT_CHUNK_BYTES):
+            reader.feed(frame[start : start + STDOUT_CHUNK_BYTES], awaited_id=AWAITED_ID)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert reader.skipped_large_frames == 1, "this frame is meant to be dropped unparsed"
+    return peak
+
+
+def test_a_frame_dropped_unparsed_is_copied_once_rather_than_twice():
+    """The peek saves the parse; it should not hand back the saving in copies.
+
+    A frame still has to come off the buffer before the peek can read it, and
+    slicing a bytearray builds a bytearray that `bytes()` then copies again. So
+    a frame nobody asked for cost three copies of itself, and a flood of 8 MB
+    ones was the shape that showed it: 24.5 MB of peak allocation per frame,
+    against 16.5 MB through a memoryview.
+    """
+    frame = large_frame({"jsonrpc": "2.0", "id": OTHER_ID})
+
+    peak = peak_bytes_feeding(frame)
+
+    assert peak < len(frame) * MAX_PEAK_BYTES_PER_FRAME, (
+        f"{len(frame)} bytes peaked at {peak} ({peak / len(frame):.1f}x)"
+    )
 
 
 def test_an_unterminated_string_is_noise_rather_than_a_depth_error():
