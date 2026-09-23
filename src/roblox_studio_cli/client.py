@@ -31,7 +31,8 @@ Design notes worth knowing before editing:
   is waiting on their own answer while we are polite.
 - Both pipes are bounded. stdout's three bounds live in `framing` (a per-frame
   cap, a per-request parse budget, and dropping a large frame that answers
-  another request); `STDERR_MAX_LINE_BYTES` does the same job on the other pipe.
+  another request); the other pipe belongs to `stderr_capture`, ring buffer and
+  all, and this module only hands it the stream and quotes what it kept.
 - The request write is non-blocking and deadline-driven. A server that stops
   reading its stdin used to wedge this process forever once the pipe buffer
   filled, which a 300 KB `--file` reaches on the first write.
@@ -45,9 +46,7 @@ import logging
 import os
 import select
 import subprocess
-import threading
 import time
-from collections import deque
 
 from roblox_studio_cli import __version__
 from roblox_studio_cli.errors import (
@@ -71,7 +70,7 @@ from roblox_studio_cli.mcp_payloads import (
     parse_tool_call_result,
     raise_for_rpc_error,
 )
-from roblox_studio_cli.terminal import sanitize_diagnostic_line
+from roblox_studio_cli.stderr_capture import ProxyStderrCapture
 
 logger = logging.getLogger(__name__)
 
@@ -88,7 +87,6 @@ DEFAULT_CALL_TOOL_TIMEOUT_SECONDS = 120.0
 
 STDOUT_POLL_INTERVAL_SECONDS = 0.2
 STDOUT_READ_CHUNK_BYTES = 65536
-STDERR_MAX_LINE_BYTES = 64 * 1024
 # A write that cannot make progress in this long is a proxy that stopped reading.
 DEFAULT_WRITE_TIMEOUT_SECONDS = 15.0
 # The most a decline may be. POSIX makes a pipe write of at most PIPE_BUF bytes
@@ -99,8 +97,6 @@ MAX_DECLINE_REPLY_BYTES = select.PIPE_BUF
 # EOF, so this grace only ever pays out for a wedged child.
 SHUTDOWN_GRACE_SECONDS = 3.0
 KILL_GRACE_SECONDS = 2.0
-STDERR_RING_BUFFER_LINES = 200
-STDERR_QUOTE_LINES = 6
 # A server that keeps handing back a nextCursor would otherwise loop forever.
 TOOLS_LIST_PAGE_LIMIT = 50
 
@@ -108,7 +104,6 @@ STUDIO_NOT_ENABLED_MESSAGE = (
     "Studio's MCP server is not enabled. In Roblox Studio: "
     "Assistant settings > MCP Servers > Enable Studio as MCP server."
 )
-PROXY_NO_TOOLS_STDERR_MARKER = "Timed out waiting for tools to become available"
 
 
 def resolve_studio_binary_path() -> str:
@@ -147,9 +142,7 @@ class StudioMcpClient:
         self.stdout_fd: int | None = None
         self.stdin_fd: int | None = None
         self.frames = StdoutFrameReader()
-        self.stderr_lines: deque[str] = deque(maxlen=STDERR_RING_BUFFER_LINES)
-        self.stderr_lock = threading.Lock()
-        self.stderr_thread: threading.Thread | None = None
+        self.stderr_capture = ProxyStderrCapture()
         self.request_counter = 0
         self.server_info: dict = {}
         self.server_capabilities: dict = {}
@@ -198,10 +191,7 @@ class StudioMcpClient:
             # Writes go to the raw fd, never through the buffered writer, so the
             # deadline in `write_all` is the only thing that can end a write.
             os.set_blocking(self.stdin_fd, False)
-            self.stderr_thread = threading.Thread(
-                target=self.drain_stderr, name="studio-mcp-stderr", daemon=True
-            )
-            self.stderr_thread.start()
+            self.stderr_capture.start(self.process.stderr)
 
             result = self.send_request(
                 "initialize",
@@ -257,14 +247,14 @@ class StudioMcpClient:
                 # list is simply longer than the deadline, which is worth saying.
                 raise StudioMcpTimeoutError(
                     f"tools/list had no time left to ask for page {page_number}; "
-                    f"{len(tools)} tools arrived before it.{self.stderr_suffix()}"
+                    f"{len(tools)} tools arrived before it.{self.stderr_capture.stderr_suffix()}"
                 )
             try:
                 result = self.send_request(
                     "tools/list", params, timeout=remaining, byte_budget=byte_budget
                 )
             except StudioMcpTimeoutError as timeout_error:
-                if self.studio_reported_no_tools():
+                if self.stderr_capture.studio_reported_no_tools():
                     raise self.not_connected_error() from timeout_error
                 raise
 
@@ -340,7 +330,7 @@ class StudioMcpClient:
         response = self.read_response(request_id, deadline=deadline)
         if response is None:
             raise StudioMcpTimeoutError(
-                f"no response to {method!r} within {timeout:.1f}s.{self.stderr_suffix()}"
+                f"no response to {method!r} within {timeout:.1f}s.{self.stderr_capture.stderr_suffix()}"
             )
         raise_for_rpc_error(response)
         result = response.get("result")
@@ -378,7 +368,7 @@ class StudioMcpClient:
                 raise StudioMcpTimeoutError(
                     f"the Studio MCP proxy stopped reading its input "
                     f"({len(payload) - len(remaining_payload)} of {len(payload)} bytes written)."
-                    f"{self.stderr_suffix()}"
+                    f"{self.stderr_capture.stderr_suffix()}"
                 )
             _, writable, _ = select.select(
                 [], [self.stdin_fd], [], min(remaining_seconds, STDOUT_POLL_INTERVAL_SECONDS)
@@ -387,7 +377,7 @@ class StudioMcpClient:
                 if self.process.poll() is not None:
                     raise StudioMcpError(
                         f"the Studio MCP proxy exited (code {self.process.returncode})."
-                        f"{self.stderr_suffix()}"
+                        f"{self.stderr_capture.stderr_suffix()}"
                     )
                 continue
             try:
@@ -396,7 +386,7 @@ class StudioMcpClient:
                 continue
             except (OSError, ValueError) as write_error:
                 raise StudioMcpError(
-                    f"the Studio MCP proxy closed its input: {write_error}.{self.stderr_suffix()}"
+                    f"the Studio MCP proxy closed its input: {write_error}.{self.stderr_capture.stderr_suffix()}"
                 ) from write_error
             remaining_payload = remaining_payload[written:]
 
@@ -473,14 +463,14 @@ class StudioMcpClient:
                 if self.process.poll() is not None:
                     raise StudioMcpError(
                         f"the Studio MCP proxy exited (code {self.process.returncode})."
-                        f"{self.stderr_suffix()}"
+                        f"{self.stderr_capture.stderr_suffix()}"
                     )
                 continue
 
             chunk = os.read(self.stdout_fd, STDOUT_READ_CHUNK_BYTES)
             if not chunk:
                 raise StudioMcpError(
-                    f"the Studio MCP proxy closed its output.{self.stderr_suffix()}"
+                    f"the Studio MCP proxy closed its output.{self.stderr_capture.stderr_suffix()}"
                 )
             self.frames.feed(chunk, awaited_id)
             self.enforce_message_size_limit()
@@ -500,62 +490,10 @@ class StudioMcpClient:
             logger.warning("could not kill the Studio MCP proxy: %s", kill_error)
         raise StudioMcpError(self.frames.oversized_line_message())
 
-    def drain_stderr(self) -> None:
-        """Thread body: copy the proxy's stderr into a ring buffer, line by line.
-
-        Each `readline` is capped, and an over-long line is read to its end one
-        capped chunk at a time, keeping only the last chunk. So a proxy that logs
-        one enormous line cannot grow this process, and what lands in the ring
-        buffer is that line's TAIL, which is where a log line puts its message.
-        """
-        stderr_stream = self.process.stderr
-        try:
-            while True:
-                raw_line = stderr_stream.readline(STDERR_MAX_LINE_BYTES)
-                if not raw_line:
-                    return
-                while not raw_line.endswith(b"\n"):
-                    # Over-long line: drop the remainder rather than buffer it.
-                    extra = stderr_stream.readline(STDERR_MAX_LINE_BYTES)
-                    if not extra:
-                        break
-                    raw_line = extra
-                line = raw_line.decode("utf-8", errors="replace").rstrip()
-                if not line:
-                    continue
-                with self.stderr_lock:
-                    self.stderr_lines.append(line)
-                logger.debug("StudioMCP stderr: %s", line)
-        except (OSError, ValueError):
-            # close() got there first and closed the pipe under us.
-            return
-
-    def recent_stderr(self, max_lines: int = STDERR_QUOTE_LINES) -> str:
-        """The last few stderr lines the proxy logged, newest last."""
-        with self.stderr_lock:
-            lines = list(self.stderr_lines)
-        return "\n".join(lines[-max_lines:])
-
-    def stderr_suffix(self) -> str:
-        """Recent stderr, sanitised and capped per line, for appending to an exception.
-
-        Each quoted line is diagnostic chrome whose length the proxy chose, and
-        `STDERR_MAX_LINE_BYTES` lets a 64 KB one into the ring buffer, so six of
-        them used to mean 384 KB under a one-line message.
-        """
-        quoted = [sanitize_diagnostic_line(line) for line in self.recent_stderr().splitlines()]
-        stderr_text = "\n".join(line for line in quoted if line)
-        return f"\nProxy stderr:\n{stderr_text}" if stderr_text else ""
-
     def not_connected_error(self) -> StudioNotConnectedError:
         """Build the "turn the toggle on" error, quoting the proxy's own WARN."""
-        return StudioNotConnectedError(f"{STUDIO_NOT_ENABLED_MESSAGE}{self.stderr_suffix()}")
-
-    def studio_reported_no_tools(self) -> bool:
-        """True when the proxy logged its "no tools" WARN, meaning Studio never attached."""
-        return PROXY_NO_TOOLS_STDERR_MARKER in self.recent_stderr(
-            max_lines=STDERR_RING_BUFFER_LINES
-        )
+        suffix = self.stderr_capture.stderr_suffix()
+        return StudioNotConnectedError(f"{STUDIO_NOT_ENABLED_MESSAGE}{suffix}")
 
     def require_started(self) -> None:
         """Guard for calls that need a live process."""
@@ -588,16 +526,9 @@ class StudioMcpClient:
                 process.kill()
                 process.wait()
 
-        # Closing stderr while the drain thread is parked inside readline() on the
-        # same buffered reader blocks on that thread's lock, which is how close()
-        # used to take 90 s. Leave the pipe to the daemon thread unless the drain
-        # has actually finished.
-        drain_finished = True
-        if self.stderr_thread is not None:
-            self.stderr_thread.join(timeout=KILL_GRACE_SECONDS)
-            drain_finished = not self.stderr_thread.is_alive()
-            self.stderr_thread = None
-        if drain_finished and process.stderr is not None:
+        # Only once the drain has finished: closing the pipe under a thread still
+        # parked in readline() blocks on that thread's lock (see `join_drain`).
+        if self.stderr_capture.join_drain(KILL_GRACE_SECONDS) and process.stderr is not None:
             try:
                 process.stderr.close()
             except OSError:

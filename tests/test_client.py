@@ -23,13 +23,7 @@ import pytest
 from fake_studio_mcp_server import CLIENT_REPLY_MARKER, QUESTION_FLOOD_COUNT
 
 from roblox_studio_cli import client as client_module
-from roblox_studio_cli.client import (
-    PROXY_NO_TOOLS_STDERR_MARKER,
-    STDERR_MAX_LINE_BYTES,
-    STDERR_QUOTE_LINES,
-    STUDIO_NOT_ENABLED_MESSAGE,
-    StudioMcpClient,
-)
+from roblox_studio_cli.client import STUDIO_NOT_ENABLED_MESSAGE, StudioMcpClient
 from roblox_studio_cli.errors import (
     StudioMcpError,
     StudioMcpProtocolError,
@@ -38,7 +32,7 @@ from roblox_studio_cli.errors import (
 )
 from roblox_studio_cli.framing import MAX_MESSAGE_BYTES
 from roblox_studio_cli.mcp_payloads import METHOD_NOT_FOUND_CODE
-from roblox_studio_cli.terminal import MAX_DIAGNOSTIC_TEXT_CHARS
+from roblox_studio_cli.stderr_capture import PROXY_NO_TOOLS_STDERR_MARKER
 
 FAKE_SERVER_PATH = Path(__file__).resolve().parent / "fake_studio_mcp_server.py"
 PNG_MAGIC_BYTES = b"\x89PNG\r\n\x1a\n"
@@ -209,25 +203,9 @@ def test_stderr_flood_neither_wedges_nor_is_kept(fake_client):
     """A 200 KB stderr line is drained and dropped; the ordinary line after it survives."""
     client = fake_client("noisy-stderr")
     assert client.list_tools()
-    recent = client.recent_stderr()
+    recent = client.stderr_capture.recent_stderr()
     assert "back to normal" in recent
     assert len(recent) < 10_000, "the over-long line was buffered instead of discarded"
-
-
-def test_quoted_stderr_is_capped_one_line_at_a_time():
-    """Six lines the proxy chose the length of used to be six lines of 64 KB.
-
-    The ring buffer bounds how many lines are kept and how long each may be on
-    the way in; this is the second half, bounding what an exception message
-    prints out of them.
-    """
-    client = StudioMcpClient(command=["/nonexistent/StudioMCP"])
-    for _ in range(STDERR_QUOTE_LINES + 4):
-        client.stderr_lines.append("x" * STDERR_MAX_LINE_BYTES)
-
-    suffix = client.stderr_suffix()
-    assert "Proxy stderr:" in suffix
-    assert len(suffix) < STDERR_QUOTE_LINES * (MAX_DIAGNOSTIC_TEXT_CHARS + 1) + 32, len(suffix)
 
 
 def test_malformed_frames_are_survivable(fake_client):
@@ -402,9 +380,9 @@ def test_a_request_the_server_makes_of_us_is_declined_rather_than_ignored(fake_c
     client.list_tools()
     expected = f"{CLIENT_REPLY_MARKER} {METHOD_NOT_FOUND_CODE}"
     deadline = time.monotonic() + SERVER_REPLY_WAIT_SECONDS
-    while expected not in client.recent_stderr() and time.monotonic() < deadline:
+    while expected not in client.stderr_capture.recent_stderr() and time.monotonic() < deadline:
         time.sleep(STDERR_POLL_INTERVAL_SECONDS)
-    assert expected in client.recent_stderr(), "the server was left waiting for a reply"
+    assert expected in client.stderr_capture.recent_stderr(), "the server was left waiting for a reply"
 
 
 def test_a_server_that_echoes_ids_as_strings_is_answered_normally(fake_client):
