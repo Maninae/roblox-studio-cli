@@ -15,16 +15,27 @@ everything a CLI needs to show, and drops the rest. Four passes, in order:
    single-character escapes.
 2. Every remaining C0 and C1 control character, DEL included. Carriage return
    goes too, since redrawing a line is how output hides itself.
-3. Invisible and reordering Unicode: zero-width characters, the bidi overrides
-   and isolates, the line and paragraph separators, the soft hyphen, the Hangul
-   fillers, the BOM, and the tag block. None of these are executed by a
-   terminal, but all of them change what a reader sees without changing the
-   characters they can select: RLO reverses a rendered filename, a zero-width
-   joiner hides a word boundary, a soft hyphen splits a word for anyone
-   searching the output, and a tag-character run is invisible payload.
-4. Runs of combining marks, trimmed to three per base character. A base with
-   hundreds of marks on it renders as a vertical smear over the rows above and
-   below, hiding output the reader came for, using nothing a terminal executes.
+3. The invisible characters no Unicode category names: the line and paragraph
+   separators (Zl and Zp), the Hangul fillers (letters, with width and no ink),
+   and the whole tag block, half of which is unassigned rather than format.
+4. One walk over the characters, applying the three rules that are category
+   questions rather than range questions:
+   - Format characters (Cf) go, all of them. That is the zero-width set, the
+     bidi overrides and isolates, the soft hyphen, the BOM, the assigned tag
+     characters, and the ones no hand-written range had: U+061C, U+180E and
+     the interlinear annotation marks. None are executed by a terminal and all
+     change what a reader sees without changing what they can select: RLO
+     reverses a rendered filename, a soft hyphen splits a word for anyone
+     searching the output. Losing the ZWJ inside an emoji sequence is the
+     accepted cost.
+   - Surrogates (Cs) go. `json.loads` produces a lone surrogate from a
+     `"\udcff"` escape, and it is not encodable as UTF-8 at all: printing one
+     raised `UnicodeEncodeError` and cost the command its entire output, which
+     for `doctor` meant three rows and no verdict.
+   - Runs of combining marks (Mn, Mc, Me), trimmed to three per base character.
+     A base with hundreds of marks renders as a vertical smear over the rows
+     above and below, hiding output the reader came for, using nothing a
+     terminal executes.
 
 `--json` output does not go through this: `json.dumps` already escapes control
 characters as `\uXXXX`, a consumer parsing JSON is not a terminal, and a caller
@@ -46,26 +57,25 @@ ESCAPE_SEQUENCE_PATTERN = re.compile(
     "|\x1b."
 )
 CONTROL_CHARACTER_PATTERN = re.compile("[\x00-\x08\x0b-\x1f\x7f-\x9f]")
-# Invisible or reordering, none of it executed by a terminal: the soft hyphen
-# (splits a word for anyone searching the output), the Hangul fillers (width
-# with no ink), zero-width and bidi marks (200b-200f), the line and paragraph
-# separators, bidi embeddings and overrides (202a-202e), the invisible-operator
-# block (2060-2064), the bidi isolates (2066-2069), the byte order mark, and the
-# tag block used to smuggle text that renders as nothing at all.
+# The invisible characters that are NOT format characters, so the category walk
+# below cannot find them: the Hangul fillers (letters, width with no ink, the
+# halfwidth one included), the line and paragraph separators (Zl and Zp), and
+# the tag block, whose unassigned half is Cn rather than Cf and which is the
+# classic way to smuggle a sentence that renders as nothing at all.
 INVISIBLE_CHARACTER_PATTERN = re.compile(
-    "[\u00ad"
-    "\u115f\u1160\u3164"
-    "\u200b-\u200f"
+    "[\u115f\u1160\u3164\uffa0"
     "\u2028\u2029"
-    "\u202a-\u202e"
-    "\u2060-\u2064"
-    "\u2066-\u2069"
-    "\ufeff"
     "\U000e0000-\U000e007f]"
 )
-# Marks that attach to the character before them. More than a few on one base is
-# not a script, it is a smear across the neighbouring rows.
-COMBINING_MARK_CATEGORIES = frozenset({"Mn", "Mc"})
+# Dropped wholesale by category, because enumerating ranges by hand is what let
+# U+061C, U+180E and U+FFF9-FFFB through: Cf is every format character
+# (zero-width, bidi, soft hyphen, BOM, tags) and Cs is the surrogates, which a
+# UTF-8 stdout cannot encode at all.
+DISCARDED_UNICODE_CATEGORIES = frozenset({"Cf", "Cs"})
+# Marks that attach to the character before them, the enclosing ones (Me)
+# included. More than a few on one base is not a script, it is a smear across
+# the neighbouring rows.
+COMBINING_MARK_CATEGORIES = frozenset({"Mn", "Mc", "Me"})
 MAX_COMBINING_MARKS_PER_BASE = 3
 # What a row-shaped or one-line-shaped print turns a newline or tab into.
 LINE_BREAK_REPLACEMENT = " "
@@ -99,20 +109,29 @@ def sanitize_terminal_text(text: str) -> str:
     without_sequences = ESCAPE_SEQUENCE_PATTERN.sub("", text)
     without_controls = CONTROL_CHARACTER_PATTERN.sub("", without_sequences)
     without_invisibles = INVISIBLE_CHARACTER_PATTERN.sub("", without_controls)
-    return limit_combining_mark_runs(without_invisibles)
+    return apply_unicode_category_rules(without_invisibles)
 
 
-def limit_combining_mark_runs(text: str) -> str:
-    """Keep at most three combining marks on any one base character.
+def apply_unicode_category_rules(text: str) -> str:
+    """Drop format characters and surrogates, and cap combining marks per base.
 
-    Tool output is never truncated, so a server can print as much as it likes;
-    what it may not do is print it ON something else. A base character carrying
-    hundreds of Mn marks ("Zalgo" text) draws over the rows above and below it,
-    and every character in it is ordinary printable Unicode. Three marks is more
-    than Vietnamese or Thai stack, so real text passes through untouched.
+    Three rules that are questions about a character's category rather than
+    about a range, which is why they are a walk rather than a fourth regex:
 
-    ASCII short-circuits the character walk, which is every large tool result in
-    practice: no ASCII character is a combining mark. Measured on this laptop,
+    - Cf, the format characters, are dropped. Hand-written ranges kept missing
+      members of this set (U+061C, U+180E, the interlinear annotation marks),
+      and the category cannot.
+    - Cs, the surrogates, are dropped. A lone surrogate is unencodable as UTF-8,
+      so one in a tool name took the whole command's output with it.
+    - Combining marks are capped at three per base character. Tool output is
+      never truncated, so a server can print as much as it likes; what it may
+      not do is print it ON something else. A base carrying hundreds of marks
+      ("Zalgo" text) draws over the rows above and below, using nothing a
+      terminal executes. Three is more than Vietnamese or Thai stack, so real
+      text passes through untouched.
+
+    ASCII short-circuits the walk, which is every large tool result in practice:
+    no ASCII character is in any of these categories. Measured on this laptop,
     4.6 MB of ASCII output sanitises in 29 ms and 4.3 MB of non-ASCII in 0.4 s,
     against a per-request parse budget of 16 MB.
     """
@@ -121,7 +140,10 @@ def limit_combining_mark_runs(text: str) -> str:
     kept: list[str] = []
     marks_on_this_base = 0
     for character in text:
-        if unicodedata.category(character) in COMBINING_MARK_CATEGORIES:
+        category = unicodedata.category(character)
+        if category in DISCARDED_UNICODE_CATEGORIES:
+            continue
+        if category in COMBINING_MARK_CATEGORIES:
             marks_on_this_base += 1
             if marks_on_this_base > MAX_COMBINING_MARKS_PER_BASE:
                 continue

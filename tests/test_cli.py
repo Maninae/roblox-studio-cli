@@ -442,6 +442,27 @@ def test_a_server_info_that_is_not_an_object_still_reaches_a_verdict():
     assert "AttributeError" not in output
 
 
+def test_a_lone_surrogate_does_not_cost_the_report_its_verdict():
+    """`"\\udcff"` is legal JSON and unencodable as UTF-8, so printing it raised.
+
+    The doctor prints its rows before its verdict, so the exception landed
+    between them: three rows, no verdict, exit 1, against a Studio that was fine.
+    """
+    result = invoke(["doctor"], mode="lone-surrogate")
+    assert result.exit_code == EXIT_OK, all_output(result)
+    output = all_output(result)
+    assert "FakeStudio 1.0.0" in output, "the server name lost more than the surrogate"
+    assert "studio-1 (Baseplate)" in output
+    assert "CONNECTED (6 tools, 1 instance)" in output
+    assert "UnicodeEncodeError" not in output
+
+
+def test_a_lone_surrogate_in_a_tool_answer_still_prints_the_answer():
+    result = invoke(["luau", "return 1"], mode="lone-surrogate")
+    assert result.exit_code == EXIT_OK, all_output(result)
+    assert "luau ok (surrogate)" in all_output(result)
+
+
 def test_doctor_json_still_carries_the_full_field():
     """--json is for a consumer, not a terminal: it gets the bytes as sent."""
     report = json.loads(invoke(["doctor", "--json"], mode="giant-names").output)

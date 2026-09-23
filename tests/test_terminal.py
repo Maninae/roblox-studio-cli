@@ -83,6 +83,50 @@ def test_a_tag_smuggled_instruction_is_dropped_entirely():
     assert sanitize_terminal_text(f"screen_capture{smuggled}") == "screen_capture"
 
 
+@pytest.mark.parametrize(
+    "label, hostile",
+    [
+        ("Arabic letter mark", "vis؜ible"),
+        ("Mongolian vowel separator", "vis᠎ible"),
+        ("interlinear annotation anchor", "vis￹ible"),
+        ("interlinear annotation separator", "vis￺ible"),
+        ("interlinear annotation terminator", "vis￻ible"),
+        ("halfwidth Hangul filler", "visﾠible"),
+    ],
+)
+def test_the_format_characters_no_hand_written_range_listed_are_dropped_too(label, hostile):
+    """The enumerated ranges missed these; the category they share does not."""
+    assert sanitize_terminal_text(hostile) == "visible", label
+
+
+@pytest.mark.parametrize(
+    "label, hostile, expected",
+    [
+        ("lone low surrogate", "vis\udcffible", "visible"),
+        ("lone high surrogate", "vis\ud800ible", "visible"),
+        # Written with chr(), because CPython folds a surrogate PAIR in a string
+        # literal back into the astral character it encodes.
+        ("both halves of a pair", chr(0xD83D) + chr(0xDE00) + "visible", "visible"),
+    ],
+)
+def test_surrogates_never_reach_a_utf_8_terminal(label, hostile, expected):
+    """A lone surrogate is unencodable, so printing one raises instead of printing.
+
+    `json.loads` produces them happily from a `"\\udcff"` escape on the wire, and
+    the result cost the command its whole output: `UnicodeEncodeError` on the
+    first print, exit 1, and for `doctor` no verdict at all.
+    """
+    cleaned = sanitize_terminal_text(hostile)
+    assert cleaned == expected, label
+    # The line that used to raise: encoding for a UTF-8 stdout.
+    assert cleaned.encode("utf-8").decode("utf-8") == expected, label
+
+
+def test_a_smear_of_enclosing_marks_is_trimmed_like_any_other_run():
+    """Me marks draw a circle per mark around the base, which smears the same way."""
+    assert sanitize_terminal_text("a" + "⃝" * 60 + "b") == "a⃝⃝⃝b"
+
+
 def test_single_line_folds_newlines_and_tabs_into_spaces():
     """A name with a newline in it must not forge a second row of output."""
     assert sanitize_single_line("first\nsecond") == "first second"

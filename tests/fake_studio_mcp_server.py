@@ -58,6 +58,8 @@ What the pipe is doing (the transport's own hazards):
     odd-serverinfo the handshake names the server with a bare string where the
                    spec has an object, which is a shape every reader of it has
                    to survive
+    lone-surrogate a `\\udcff` escape in the server name, the instance name and
+                   a tool result: legal JSON, and unencodable as UTF-8
 """
 
 import json
@@ -71,6 +73,15 @@ SERVER_INFO = {"name": "FakeRobloxStudio", "version": "1.0.0"}
 SERVER_INSTRUCTIONS = "Studio MCP Proxy - bridges MCP clients with Roblox Studio"
 # A string where the spec has an object: every reader of serverInfo meets it.
 ODD_SERVER_INFO = "x"
+
+# `json.dumps` writes this as the ASCII escape "\udcff" and `json.loads` hands
+# back the lone surrogate, which no UTF-8 stdout can encode. The three fields
+# here are the three kinds of place it can land: the handshake, an identifier
+# the CLI prints as a row, and the answer itself.
+LONE_SURROGATE = "\udcff"
+SURROGATE_SERVER_INFO = {"name": "Fake" + LONE_SURROGATE + "Studio", "version": "1.0.0"}
+SURROGATE_INSTANCES = [{"id": "studio-1", "name": "Base" + LONE_SURROGATE + "plate"}]
+SURROGATE_TOOL_TEXT = "luau ok" + LONE_SURROGATE + " (surrogate)"
 
 # Byte-identical to the real proxy's warning, because the client quotes it back.
 NO_TOOLS_WARNING = (
@@ -211,6 +222,7 @@ SECOND_PAGE_CURSOR = "page-2"
 
 INSTANCES_BY_MODE = {
     "connected": [{"id": "studio-1", "name": "Baseplate"}],
+    "lone-surrogate": SURROGATE_INSTANCES,
     "crowded": [
         {"id": "studio-%d" % index, "name": "Place%d" % index} for index in range(CROWD_SIZE)
     ],
@@ -266,6 +278,8 @@ def server_info_for(mode: str):
         return {"name": "x" * GIANT_TEXT_CHARS, "version": "v" * GIANT_TEXT_CHARS}
     if mode == "odd-serverinfo":
         return ODD_SERVER_INFO
+    if mode == "lone-surrogate":
+        return SURROGATE_SERVER_INFO
     return SERVER_INFO
 
 
@@ -348,7 +362,11 @@ def handle_tools_call(request_id: int, params: dict, mode: str) -> Optional[dict
         result = list_studios_result(mode)
     elif name == "execute_luau":
         # Echo the arguments so tests can assert what discovery filled in.
-        result = text_result("luau ok: " + json.dumps(arguments, sort_keys=True))
+        result = text_result(
+            SURROGATE_TOOL_TEXT
+            if mode == "lone-surrogate"
+            else "luau ok: " + json.dumps(arguments, sort_keys=True)
+        )
     elif name == "get_studio_state":
         result = text_result(json.dumps({"place": "Baseplate", "is_playing": False}))
     elif name == "start_stop_play":
