@@ -11,7 +11,9 @@ too long to convert, and large frames answering a request nobody sent.
 """
 
 import json
+import signal
 import time
+from contextlib import contextmanager
 
 import pytest
 
@@ -71,6 +73,36 @@ def frame_quoting_another_id_first(own_id) -> bytes:
     return json.dumps(body).encode("utf-8") + b"\n"
 
 
+@contextmanager
+def wall_clock_budget(seconds: float, description: str):
+    """Fail the block inside at `seconds`, whatever it is spending them on.
+
+    Timing a call and asserting afterwards cannot fail a regression that does
+    not return, and not returning is the exact shape of the one below: the
+    regex this scan replaced is quadratic, so 4 MB of the hostile frame runs for
+    hours. A test that hangs is worse than one that fails, because it holds a CI
+    runner to the runner's own limit instead of printing a red line.
+
+    A daemon thread and `join(budget)` do not bound it either, measured on the
+    regex this replaced: `join(1.0)` came back after 37.65 s, because `re` holds
+    the GIL for the whole of one `sub()` call and nothing can preempt it. SIGALRM
+    can: the regex engine checks for signals as it runs, so the alarm turns the
+    hang into a failure after 1.08 s. Main thread only, which is where pytest
+    runs a test.
+    """
+
+    def ring(signal_number, frame):
+        raise TimeoutError(f"{description} spent more than {seconds:.1f}s")
+
+    previous_handler = signal.signal(signal.SIGALRM, ring)
+    signal.setitimer(signal.ITIMER_REAL, seconds)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous_handler)
+
+
 def unterminated_string_frame(total_bytes: int) -> bytes:
     """Open a string, pad it with escaped quotes, never close it, then over-open.
 
@@ -103,7 +135,8 @@ def test_an_unterminated_string_costs_time_linear_in_its_length(frame_bytes, bud
     line = unterminated_string_frame(frame_bytes)
 
     started = time.perf_counter()
-    verdict = exceeds_container_depth(line)
+    with wall_clock_budget(budget_seconds, f"the depth scan of {len(line)} bytes"):
+        verdict = exceeds_container_depth(line)
     elapsed = time.perf_counter() - started
 
     assert elapsed < budget_seconds, f"{len(line)} bytes took {elapsed:.1f}s"

@@ -23,6 +23,10 @@ jobs:
       matrix:
         python-version: ["3.10", "3.12", "3.14"]
     name: test (python ${{ matrix.python-version }})
+    # The suite runs in about a minute. This is the backstop for a regression
+    # that hangs rather than fails: without it a runner sits on GitHub's own
+    # six-hour limit before anyone sees a red line.
+    timeout-minutes: 15
     steps:
       # Actions are pinned by commit, not by tag: a tag is a moving pointer the
       # action's owner can repoint, and this workflow runs with the repository
