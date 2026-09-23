@@ -186,6 +186,47 @@ def test_a_frame_dropped_unparsed_is_copied_once_rather_than_twice():
     )
 
 
+def test_a_frame_that_ends_in_crlf_is_copied_once_as_well():
+    """`bytes(line).strip()` is one copy only while there is nothing to strip.
+
+    CPython hands `strip()` back the same object when it removes nothing, which
+    is why the frame above measures at 2.1x. A carriage return before the
+    newline is all it takes to make that false, it costs the sender one byte,
+    and then every frame pays the copy the memoryview was introduced to save:
+    measured on this frame, 3.1x against 2.1x. Trimming the view before the
+    copy holds the claim whatever the line ends with.
+    """
+    frame = large_frame({"jsonrpc": "2.0", "id": OTHER_ID}).replace(b"\n", b"\r\n")
+
+    peak = peak_bytes_feeding(frame)
+
+    assert peak < len(frame) * MAX_PEAK_BYTES_PER_FRAME, (
+        f"{len(frame)} bytes peaked at {peak} ({peak / len(frame):.1f}x)"
+    )
+
+
+def test_a_frame_padded_with_whitespace_stays_as_cheap_as_a_newline_flood():
+    """Trimming by index is interpreted, so a frame of nothing but padding is not.
+
+    A whitespace-only frame is charged one byte of budget, exactly as a bare
+    newline is, so a flood of them is bounded by nothing but the pipe and has
+    to stay linear with a small constant. Walking 8 MB of spaces one byte at a
+    time takes 234 ms against 2.3 ms in C, which is why the walk stops early
+    and hands a frame padded past the window back to `strip()`.
+    """
+    frame = b" " * (MAX_MESSAGE_BYTES // 2) + b"\n"
+    reader = StdoutFrameReader()
+    reader.begin_request(MAX_TOOLS_LIST_TOTAL_BYTES)
+
+    started = time.monotonic()
+    reader.feed(frame, awaited_id=AWAITED_ID)
+    elapsed = time.monotonic() - started
+
+    assert drain(reader) == [], "whitespace is not a frame"
+    assert reader.bytes_consumed == framing_module.EMPTY_FRAME_BUDGET_BYTES
+    assert elapsed < HOSTILE_FRAME_SECONDS, f"{len(frame)} bytes of padding took {elapsed:.2f}s"
+
+
 def test_an_unterminated_string_is_noise_rather_than_a_depth_error():
     """It is not valid JSON, so it is skipped the way any other garbage line is."""
     assert StdoutFrameReader().parse_frame(unterminated_string_frame(4096)) is None
