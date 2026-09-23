@@ -98,6 +98,29 @@ STUDIO_NOT_ENABLED_MESSAGE = (
 PROXY_NO_TOOLS_STDERR_MARKER = "Timed out waiting for tools to become available"
 
 
+def response_matches_request(message: dict, request_id: int) -> bool:
+    """True when this message is the answer to `request_id`, bare or string-shaped.
+
+    JSON-RPC lets an id be a number or a string, and a server echoing our `7` as
+    `"7"` is answering us just as squarely. `framing.awaited_id_pattern` already
+    reads both forms, so the large-frame peek keeps such a frame; matching it
+    here with `==` against an int then refused it, and since nothing else was
+    coming the call burned its whole deadline against a server that had already
+    answered.
+
+    Booleans are excluded explicitly: `True == 1` in Python, and a frame
+    answering `"id": true` is not the answer to request 1.
+    """
+    answered = message.get("id")
+    if isinstance(answered, bool):
+        return False
+    if isinstance(answered, int):
+        return answered == request_id
+    if isinstance(answered, str):
+        return answered == str(request_id)
+    return False
+
+
 def resolve_studio_binary_path() -> str:
     """Path to the Studio MCP proxy binary.
 
@@ -388,7 +411,7 @@ class StudioMcpClient:
             message = self.read_message(deadline, awaited_id=request_id)
             if message is None:
                 return None
-            if message.get("id") == request_id:
+            if response_matches_request(message, request_id):
                 return message
             logger.debug("skipping %r while waiting for id %d", message.get("method") or message.get("id"), request_id)
 

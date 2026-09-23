@@ -64,6 +64,8 @@ What the pipe is doing (the transport's own hazards):
                    a tool result: legal JSON, and unencodable as UTF-8
     odd-mime       the capture comes back as an image type no build can name a
                    file extension for, so the bytes exist and the file cannot
+    string-ids     every response echoes the request id as a string, which JSON-RPC
+                   allows and which a client matching on `==` never recognises
 """
 
 import json
@@ -272,6 +274,10 @@ lister_call_count = 0
 
 def emit(message: dict, mode: str) -> None:
     """Put one JSON-RPC message on stdout the way `mode` says to put it there."""
+    if mode == "string-ids" and message.get("id") is not None:
+        # JSON-RPC lets an id be a string, and a server echoing a numeric
+        # request id as "1" is answering that request just as squarely.
+        message = dict(message, id=str(message["id"]))
     line = json.dumps(message) + "\n"
     if mode == "chatty":
         # Notifications first, and deliberately in the SAME write as the response:

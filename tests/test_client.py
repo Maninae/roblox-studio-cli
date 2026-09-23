@@ -28,6 +28,7 @@ from roblox_studio_cli.client import (
     STDERR_QUOTE_LINES,
     STUDIO_NOT_ENABLED_MESSAGE,
     StudioMcpClient,
+    response_matches_request,
 )
 from roblox_studio_cli.errors import (
     StudioMcpError,
@@ -43,6 +44,7 @@ PNG_MAGIC_BYTES = b"\x89PNG\r\n\x1a\n"
 SILENT_SERVER_TIMEOUT_SECONDS = 2.0
 DEAF_SERVER_TIMEOUT_SECONDS = 2.0
 STUDIO_ID = "studio-1"
+AWAITED_REQUEST_ID = 7
 STRAY_FRAME_COUNT = 6
 DECOY_ANSWER_TIMEOUT_SECONDS = 3.0
 
@@ -337,3 +339,38 @@ def test_a_server_that_stops_reading_its_input_times_out_instead_of_wedging(fake
             timeout=DEAF_SERVER_TIMEOUT_SECONDS,
         )
     assert time.monotonic() - started < DEAF_SERVER_TIMEOUT_SECONDS * 3, "the write outlived it"
+
+
+@pytest.mark.parametrize(
+    "answered, matches, reason",
+    [
+        (AWAITED_REQUEST_ID, True, "our own id, exactly as we sent it"),
+        (str(AWAITED_REQUEST_ID), True, "the same id, echoed as a string"),
+        (AWAITED_REQUEST_ID * 10 + 1, False, "a neighbouring id is somebody else's"),
+        (str(AWAITED_REQUEST_ID * 10 + 1), False, "the same, as a string"),
+        (None, False, "a notification carries no id"),
+        ("", False, "an empty id answers nothing"),
+    ],
+)
+def test_a_string_shaped_id_that_equals_ours_is_ours(answered, matches, reason):
+    """The large-frame peek accepts `"id": "7"` as ours, so the matcher has to agree.
+
+    Disagreeing cost the whole timeout: the peek kept the frame, `==` against an
+    int refused it, and nothing else was ever going to arrive.
+    """
+    assert response_matches_request({"id": answered}, AWAITED_REQUEST_ID) is matches, reason
+
+
+def test_a_boolean_id_is_not_the_integer_it_equals():
+    """`True == 1` in Python, and a frame answering `"id": true` is not answering id 1."""
+    assert response_matches_request({"id": True}, 1) is False
+
+
+def test_a_server_that_echoes_ids_as_strings_is_answered_normally(fake_client):
+    """JSON-RPC allows a string id, and every response from such a build was ignored."""
+    client = fake_client("string-ids")
+    result = client.call_tool(
+        "execute_luau", {"code": "return 1", "datamodel_type": "Edit", "studio_id": STUDIO_ID}
+    )
+    assert result.is_error is False
+    assert "luau ok" in result.text
