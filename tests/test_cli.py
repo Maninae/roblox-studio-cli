@@ -441,6 +441,22 @@ def test_doctor_caps_the_fields_whose_length_the_server_chooses():
     assert len(output) < 1500, "the server's own text reached the terminal at its own length"
 
 
+def test_the_tool_rows_cap_the_name_and_the_argument_list_like_every_other_row():
+    """A tool row is chrome the server sizes: its name, and how many arguments it lists.
+
+    The row was folded onto one line and never capped, so a 100 KB tool name
+    printed in full, and a schema with forty arguments printed forty of them.
+    """
+    result = invoke(["tools"], mode="giant-names")
+    assert result.exit_code == EXIT_OK, all_output(result)[:500]
+    output = all_output(result)
+
+    assert "t" * (MAX_DIAGNOSTIC_TEXT_CHARS + 1) not in output, "the tool name printed in full"
+    assert "and 21 more" in output, "the argument list ran to the schema's length"
+    assert "arg39" not in output
+    assert len(output) < 2000, "the listing is longer than a screen"
+
+
 def test_a_crowded_build_cannot_bury_the_advice_under_its_own_tool_list(tmp_path):
     """46 tools is already too many to print; a build with hundreds is the real case."""
     result = invoke(["call", "no_such_tool"], mode="crowded")

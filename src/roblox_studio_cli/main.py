@@ -70,6 +70,7 @@ from roblox_studio_cli.mcp_payloads import ToolCallResult, ToolDefinition
 from roblox_studio_cli.terminal import (
     capped_display_names,
     echo_server_text,
+    sanitize_diagnostic_line,
     sanitize_single_line,
 )
 
@@ -349,19 +350,20 @@ def tools(
 
     for tool in definitions:
         # Every field here is server-controlled and printed as a fixed-width row,
-        # so fold each one onto a single line BEFORE padding it: a newline inside
-        # a tool name would otherwise break the column and forge an extra row.
-        name = sanitize_single_line(tool.name)
+        # so each is folded onto one line BEFORE padding (a newline inside a tool
+        # name would break the column and forge an extra row) and capped the way
+        # every other row and enumeration is: 100 KB of clean name scrolls the
+        # listing away without a single control character in it.
+        name = sanitize_diagnostic_line(tool.name)
         echo_server_text(f"{name:<{TOOL_NAME_COLUMN_WIDTH}} "
                          f"{sanitize_single_line(tool.description_preview())}")
         if tool.argument_names:
             required = set(tool.required_argument_names)
-            rendered = ", ".join(
+            marked = [
                 f"{name}*" if name in required else name for name in tool.argument_names
-            )
-            echo_server_text(
-                f"{'':<{TOOL_NAME_COLUMN_WIDTH}} args: {sanitize_single_line(rendered)}"
-            )
+            ]
+            rendered = ", ".join(capped_display_names(marked))
+            echo_server_text(f"{'':<{TOOL_NAME_COLUMN_WIDTH}} args: {rendered}")
     typer.echo(f"\n{len(definitions)} tools (* = required)")
 
 

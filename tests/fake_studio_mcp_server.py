@@ -38,8 +38,10 @@ What the pipe is doing (the transport's own hazards):
                    numeric name, and a JSON-RPC error that is a bare string
     hostile-names  one extra tool whose name, description and argument key carry
                    newlines, an OSC escape and invisible Unicode
-    giant-names    a server that names itself, and its instance, in 100 KB of
-                   perfectly clean text: length as the attack, no escapes needed
+    giant-names    a server that names itself, its instance, one of its tools
+                   and one of that tool's arguments in 100 KB of perfectly
+                   clean text, and declares forty arguments besides: length as
+                   the attack, no escapes needed
     invalid-utf8   a stdout line that is not decodable UTF-8, then a normal answer
     stray-flood    several 200 KB frames carrying a request id nobody awaits,
                    ahead of the first page of the real answer
@@ -222,6 +224,22 @@ CROWD_TOOLS = [
     for index in range(CROWD_SIZE)
 ]
 
+# The same attack as a giant serverInfo, aimed at the rows `tools` prints: a
+# name and an argument key of 100 KB each, and more argument names than a row
+# can hold. Every one of those lengths is the server's choice.
+GIANT_NAME_TOOL = {
+    "name": "t" * GIANT_TEXT_CHARS,
+    "description": "A tool that names itself at length.",
+    "inputSchema": {
+        "type": "object",
+        "properties": dict(
+            [("a" * GIANT_TEXT_CHARS, {"type": "string"})]
+            + [("arg%02d" % index, {"type": "string"}) for index in range(CROWD_SIZE)]
+        ),
+        "required": ["a" * GIANT_TEXT_CHARS],
+    },
+}
+
 # Served in two pages so the client's nextCursor handling is exercised.
 FIRST_PAGE_SIZE = 3
 SECOND_PAGE_CURSOR = "page-2"
@@ -306,6 +324,8 @@ def tools_list_result(params: dict, mode: str) -> dict:
         return {"tools": [padded]}
     if mode == "crowded":
         return {"tools": [*TOOL_DEFINITIONS, *CROWD_TOOLS]}
+    if mode == "giant-names":
+        return {"tools": [*TOOL_DEFINITIONS, GIANT_NAME_TOOL]}
     if params.get("cursor") == SECOND_PAGE_CURSOR:
         return {"tools": TOOL_DEFINITIONS[FIRST_PAGE_SIZE:]}
     return {"tools": TOOL_DEFINITIONS[:FIRST_PAGE_SIZE], "nextCursor": SECOND_PAGE_CURSOR}
