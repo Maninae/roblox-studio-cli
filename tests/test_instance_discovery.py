@@ -8,6 +8,10 @@ records the timeout each poll was handed.
 """
 
 import pytest
+from fake_studio_mcp_server import (
+    HOSTILE_LISTER_ID_DIGITS,
+    HOSTILE_LISTER_NESTING_DEPTH,
+)
 
 from roblox_studio_cli.errors import StudioMcpTimeoutError
 from roblox_studio_cli.instance_discovery import (
@@ -43,6 +47,38 @@ def test_parse_studio_instances_handles_the_empty_and_broken_cases():
     assert parse_studio_instances("") == []
     assert parse_studio_instances("not json at all") == []
     assert parse_studio_instances('{"unexpected": 1}') == []
+
+
+def test_a_lister_payload_nested_past_any_reader_is_no_instances_rather_than_a_crash():
+    """The frame's depth scan cannot help here, and correctly does not try.
+
+    The lister's answer arrives as a JSON string inside the frame, so the
+    brackets in it are text to the scan that guards `parse_frame` and structure
+    to the parse that happens here. 200,000 of them reached the C decoder and
+    came back as `RecursionError`, which is not a `ValueError` and was not
+    caught, so it escaped `luau`, `instances` and `doctor` alike.
+    """
+    assert parse_studio_instances("[" * HOSTILE_LISTER_NESTING_DEPTH) == []
+
+
+def test_a_lister_id_longer_than_python_will_convert_is_no_instances_too():
+    """Past 4300 digits `int()` refuses the conversion, with a plain ValueError.
+
+    Legal JSON, unreadable by this interpreter, and not a `JSONDecodeError`, so
+    it escaped the same three commands the nesting above did.
+    """
+    giant_id = '{"studios": [{"id": ' + "9" * HOSTILE_LISTER_ID_DIGITS + '}]}'
+    assert parse_studio_instances(giant_id) == []
+
+
+def test_a_lister_payload_carrying_infinity_is_refused_the_way_a_frame_is():
+    """`NaN` and `Infinity` are Python extensions, not JSON, on both parses.
+
+    The frame parse refuses them so `--json` cannot re-emit something a strict
+    consumer chokes on. This payload is server bytes too and takes the same
+    hooks, so a lister answering with one reads as no instances.
+    """
+    assert parse_studio_instances('{"studios": [{"id": "a", "name": Infinity}]}') == []
 
 
 def test_parse_studio_instances_accepts_alternative_spellings_and_a_missing_name():

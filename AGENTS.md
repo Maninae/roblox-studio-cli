@@ -15,7 +15,7 @@ Orientation for anyone (human or agent) changing this repo. The README explains 
 | `stderr_capture.py` | The proxy's other pipe: drain it on a thread into a bounded ring buffer, quote the last few lines into an exception, and spot the one WARN that means Studio's MCP toggle is off. Knows nothing of requests. |
 | `client.py` | Process and protocol. Spawn the proxy, run the handshake, write requests, read the answer, decline the questions the server asks back, reap the child. Owns one `ProxyStderrCapture` and quotes it into its own errors. |
 | `tool_discovery.py` | Which live tool to call, and which of its arguments carries the value. Token matching over a `tools/list` payload, the destructive-name deny-list, and the `ToolIntent` each convenience command declares. Pure functions; no client. |
-| `instance_discovery.py` | Which Studio instance to call it on: the attach poll, the lister payload parser, and `--studio` resolution. Asks `tool_discovery` for one thing, the lister. |
+| `instance_discovery.py` | Which Studio instance to call it on: the attach poll, the lister payload parser, and `--studio` resolution. Asks `tool_discovery` for one thing, the lister, and borrows `framing`'s JSON guards for the lister's payload, which is a second parse of server bytes and gets none of them from the frame it rode in. |
 | `image_output.py` | Where a returned image lands on disk, and the refusals on the way (traversal, symlink, clobber). |
 | `luau_source.py` | Where one `luau` call's source comes from: an argument, stdin, or a file, with the same byte cap on the two that read somebody else's bytes. |
 | `display_wake.py` | macOS only: wake the display for a capture and hold it awake, because a dark display captures nothing. |
@@ -97,6 +97,7 @@ No Roblox needed: `tests/fake_studio_mcp_server.py` speaks the same wire protoco
 | `no-tools` | Answers `initialize`, never answers `tools/list`, logs the real proxy's WARN. |
 | `attach-late` | Lister errors twice, returns an empty list once, then the instance. |
 | `attach-never` | Lister keeps erroring until the window expires. |
+| `hostile-lister` | Two lister answers that are legal inside the frame and unreadable once unwrapped (nesting past the decoder, an id past the integer-conversion limit), then the instance. |
 | `chatty` | Notifications interleaved with responses, and both in a single write. |
 | `partial` | One response split mid-JSON across two writes with a delay. |
 | `noisy-stderr` | A 200 KB stderr line before answering, then an ordinary line. |

@@ -27,6 +27,10 @@ What Studio is doing:
     attach-late    the lister errors twice, returns an empty list once, then the
                    instance: what a real fresh session does for its first ~3 s
     attach-never   the lister keeps erroring, so the attach window expires
+    hostile-lister the lister answers twice with JSON that is legal inside the
+                   frame and hostile to the SECOND parse (nesting past any
+                   reader, then an id longer than Python will convert), and
+                   only then with the instance
 
 What the pipe is doing (the transport's own hazards):
 
@@ -115,6 +119,23 @@ NOT_ATTACHED_ERROR_TEXT = (
 )
 ATTACH_ERROR_POLLS = 2
 ATTACH_EMPTY_POLLS = 1
+
+# Two lister answers that are perfectly well-formed as far as the FRAME is
+# concerned and are not JSON anything can read once unwrapped. Both live inside
+# a text content item, which is a JSON string, so the frame's depth scan reads
+# their brackets as text and its number hooks never see the id: whatever guards
+# the lister's own parse has to run them itself.
+#
+#   - nesting the frame cannot see, which the C decoder answers with RecursionError
+#   - an id past the 4300-digit integer-conversion limit, which it answers with ValueError
+#
+# Neither is a JSONDecodeError, so neither used to be caught.
+HOSTILE_LISTER_NESTING_DEPTH = 200_000
+HOSTILE_LISTER_ID_DIGITS = 5_000
+HOSTILE_LISTER_TEXTS = (
+    "[" * HOSTILE_LISTER_NESTING_DEPTH,
+    '{"studios": [{"id": ' + "9" * HOSTILE_LISTER_ID_DIGITS + ', "name": "Baseplate"}]}',
+)
 
 # The real finding was a 6 MB serverInfo name; 100 KB proves the same cap and
 # keeps the suite fast.
@@ -382,6 +403,10 @@ def list_studios_result(mode: str) -> dict:
     lister_call_count += 1
     if mode == "attach-never":
         return text_result(NOT_ATTACHED_ERROR_TEXT, is_error=True)
+    if mode == "hostile-lister":
+        if lister_call_count <= len(HOSTILE_LISTER_TEXTS):
+            return text_result(HOSTILE_LISTER_TEXTS[lister_call_count - 1])
+        return text_result(json.dumps({"studios": INSTANCES_BY_MODE["connected"]}))
     if mode == "attach-late":
         if lister_call_count <= ATTACH_ERROR_POLLS:
             return text_result(NOT_ATTACHED_ERROR_TEXT, is_error=True)

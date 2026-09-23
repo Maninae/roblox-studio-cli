@@ -282,6 +282,43 @@ def test_instances_with_none_open_exits_not_ready():
     assert "No Roblox Studio instance attached" in all_output(result)
 
 
+def test_a_hostile_lister_payload_is_polled_through_rather_than_crashing_the_command():
+    """The lister's answer gets a SECOND parse, and it had none of the guards.
+
+    Two payloads, both legal inside the frame that carried them and neither
+    readable once unwrapped: 200,000 open brackets, which the C decoder answers
+    with `RecursionError`, and a 5,000-digit id, which it answers with the
+    `ValueError` past Python's integer-conversion limit. The frame's own depth
+    scan reads brackets inside a string literal as text, correctly, so it saw
+    nothing to refuse and every command that resolves an instance died on the
+    parse afterwards.
+
+    The docstring promises an unparseable payload reads as "no instances", and
+    the bridge here sends the real one on its third poll, so what this asserts
+    is that the poll survived both and kept going.
+    """
+    for command in (["instances"], ["luau", "return 1"], ["state"]):
+        result = invoke(command, mode="hostile-lister")
+        assert result.exit_code == EXIT_OK, (command, all_output(result))
+        assert "Traceback" not in all_output(result), command
+    assert '"studio_id": "studio-1"' in all_output(invoke(["luau", "return 1"], mode="hostile-lister"))
+
+
+def test_doctor_survives_a_hostile_lister_payload_and_still_renders_its_verdict():
+    """`doctor` is the one that has to print a report even when a check fails.
+
+    It died mid-report on the same two payloads, so the caller got a traceback
+    where the four rows and the verdict belong.
+    """
+    result = invoke(["doctor"], mode="hostile-lister")
+
+    assert result.exit_code == EXIT_OK, all_output(result)
+    output = all_output(result)
+    for row in ("Binary:", "Handshake:", "Tools:", "Instances:"):
+        assert row in output, (row, output)
+    assert "CONNECTED (6 tools, 1 instance)" in output
+
+
 def test_luau_fills_in_studio_id_and_the_default_context():
     """The point of the convenience command: the user types code, nothing else."""
     result = invoke(["luau", "return 1 + 1"])

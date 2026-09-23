@@ -15,6 +15,11 @@ Two facts drive the shape of it:
   `wait_for_studio_instances` polls rather than reading once and giving up.
 - Nothing may be cached between runs. Instances open and close between commands
   and ids do not survive a Studio restart, so every command resolves afresh.
+
+Its answer arrives as JSON inside a JSON frame, which makes reading it a SECOND
+parse of server bytes, with none of the guards the first one ran: brackets in
+the lister's text are a string literal to `framing`'s depth scan and structure
+to this one. So `parse_studio_instances` runs those guards itself.
 """
 
 import json
@@ -25,6 +30,12 @@ from dataclasses import dataclass, field
 
 from roblox_studio_cli.client import DEFAULT_CALL_TOOL_TIMEOUT_SECONDS, StudioMcpClient
 from roblox_studio_cli.errors import StudioMcpTimeoutError, StudioNotAttachedError
+from roblox_studio_cli.framing import (
+    MAX_FRAME_CONTAINER_DEPTH,
+    exceeds_container_depth,
+    refuse_json_constant,
+    refuse_non_finite_number,
+)
 from roblox_studio_cli.mcp_payloads import ToolDefinition
 from roblox_studio_cli.terminal import (
     capped_display_names,
@@ -100,14 +111,36 @@ def parse_studio_instances(payload_text: str) -> list[StudioInstance]:
     (any of the usual id and name spellings, and a missing name has been seen in
     the wild) or as bare id strings, and an unparseable payload reads as "no
     instances" rather than crashing the command.
+
+    This is a SECOND parse of server bytes, and the hostile JSON it has to
+    survive is the same set `framing.parse_frame` survives, so it runs the same
+    guards: the depth scan before the parse and the two number hooks inside it.
+    They do not come free from the frame the text arrived in. The frame's own
+    scan reads a bracket inside a string literal as text, correctly, and this
+    payload IS that string: 200,000 `[` in it rode through framing untouched and
+    took `luau`, `instances` and `doctor` down here with a `RecursionError`, and
+    a 5,000-digit instance id did the same with the `ValueError` Python raises
+    past its integer-conversion limit. Neither is a JSONDecodeError, so neither
+    was caught.
     """
     stripped = payload_text.strip()
     if not stripped:
         return []
+    # A lone surrogate is legal JSON and unencodable, and the scan only reads
+    # ASCII structure, so replacing what will not encode costs it nothing.
+    if exceeds_container_depth(stripped.encode("utf-8", errors="replace")):
+        logger.debug("instance list nested past %d containers", MAX_FRAME_CONTAINER_DEPTH)
+        return []
     try:
-        payload = json.loads(stripped)
-    except json.JSONDecodeError:
-        logger.debug("instance list was not JSON: %r", stripped[:200])
+        payload = json.loads(
+            stripped,
+            parse_constant=refuse_json_constant,
+            parse_float=refuse_non_finite_number,
+        )
+    except (ValueError, RecursionError):
+        # ValueError covers JSONDecodeError, the integer-conversion limit, and
+        # the two hooks above; RecursionError covers nesting the scan let past.
+        logger.debug("instance list was not JSON this build can read: %r", stripped[:200])
         return []
 
     entries = payload
