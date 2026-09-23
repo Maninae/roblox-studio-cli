@@ -29,7 +29,11 @@ import time
 from dataclasses import dataclass, field
 
 from roblox_studio_cli.client import DEFAULT_CALL_TOOL_TIMEOUT_SECONDS, StudioMcpClient
-from roblox_studio_cli.errors import StudioMcpTimeoutError, StudioNotAttachedError
+from roblox_studio_cli.errors import (
+    StudioMcpProtocolError,
+    StudioMcpTimeoutError,
+    StudioNotAttachedError,
+)
 from roblox_studio_cli.framing import (
     MAX_FRAME_CONTAINER_DEPTH,
     exceeds_container_depth,
@@ -135,8 +139,17 @@ def parse_studio_instances(payload_text: str) -> list[StudioInstance]:
         return []
     # A lone surrogate is legal JSON and unencodable, and the scan only reads
     # ASCII structure, so replacing what will not encode costs it nothing.
-    if exceeds_container_depth(stripped.encode("utf-8", errors="replace")):
-        logger.debug("instance list nested past %d containers", MAX_FRAME_CONTAINER_DEPTH)
+    try:
+        if exceeds_container_depth(stripped.encode("utf-8", errors="replace")):
+            logger.debug("instance list nested past %d containers", MAX_FRAME_CONTAINER_DEPTH)
+            return []
+    except StudioMcpProtocolError:
+        # Past its own window the scan refuses a payload rather than walking it,
+        # which on a FRAME is a protocol error worth raising. Here it is one
+        # more answer this build cannot read, and the rule for those is the same
+        # as for the rest: no instances, rather than a `doctor` that dies on the
+        # way to its verdict because the bridge answered with nonsense.
+        logger.debug("instance list carries more structure than the depth scan reads")
         return []
     try:
         payload = json.loads(

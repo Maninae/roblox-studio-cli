@@ -63,6 +63,18 @@ def test_a_lister_payload_nested_past_any_reader_is_no_instances_rather_than_a_c
     assert parse_studio_instances("[" * HOSTILE_LISTER_NESTING_DEPTH) == []
 
 
+def test_a_lister_payload_of_megabytes_of_brackets_is_no_instances_too():
+    """The depth scan refuses a frame like this, and a refusal is not this parse's answer.
+
+    Every other unreadable payload here reads as "nothing registered", because
+    the alternative is a `doctor` that dies on the way to its verdict over a
+    bridge that is merely answering nonsense. The scan borrowed from `framing`
+    raises on megabytes of structure rather than returning, so this one has to
+    be caught as well as the parser's own refusals.
+    """
+    assert parse_studio_instances("[]" * (2 * 2**20)) == []
+
+
 def test_a_lister_id_longer_than_python_will_convert_is_no_instances_too():
     """Past 4300 digits `int()` refuses the conversion, with a plain ValueError.
 

@@ -22,10 +22,12 @@ from roblox_studio_cli import framing as framing_module
 from roblox_studio_cli.errors import StudioMcpError, StudioMcpProtocolError
 from roblox_studio_cli.framing import (
     LARGE_FRAME_BYTES,
+    MAX_DEPTH_SCAN_BYTES,
     MAX_FRAME_CONTAINER_DEPTH,
     MAX_MESSAGE_BYTES,
     MAX_TOOLS_LIST_TOTAL_BYTES,
     StdoutFrameReader,
+    compact_frame_structure,
     exceeds_container_depth,
     response_matches_request,
 )
@@ -52,6 +54,12 @@ LARGE_HOSTILE_FRAME_SECONDS = 2.0
 # 4 MB of padding still walks in 0.098 s against the 1.0 s above, so the test
 # passed on the code it exists to fail. Measured here: 48x to 77x.
 MIN_TRIM_SPEEDUP = 10
+# How much cheaper the BOUNDED depth scan has to be than the same walk with its
+# window removed, on the one frame that makes the walk run to the end. Measured
+# here on 8 MiB of bracket pairs: 63 ms against 327 ms, so 5.2x. The threshold
+# is well under that, because both sides are wall clock on a shared runner and
+# the refusal itself is what `test_megabytes_of_brackets_are_refused_...` holds.
+MIN_DEPTH_SCAN_SPEEDUP = 3
 # A number literal long enough that anything worse than linear would show. The
 # measured cost is about 7 ms either way, against the one-second budget below.
 HOSTILE_NUMBER_DIGITS = 4_000_000
@@ -189,6 +197,139 @@ def test_an_unterminated_string_costs_time_linear_in_its_length(frame_bytes, bud
 
     assert elapsed < budget_seconds, f"{len(line)} bytes took {elapsed:.1f}s"
     assert verdict is False, "the openers are inside the string, so this frame nests nothing"
+
+
+def unbounded_depth_walk_seconds(line: bytes) -> float:
+    """Wall time for the depth walk `exceeds_container_depth` runs with its window removed.
+
+    The same compaction and the same loop over the same bytes, minus the one
+    thing under test, measured here rather than written down as a number: a
+    wall-clock constant is a fact about one machine, and on a loaded runner both
+    sides slow down together while the ratio between them holds.
+    """
+    started = time.monotonic()
+    structure = compact_frame_structure(line)
+    depth = 0
+    position = 0
+    length = len(structure)
+    while position < length:
+        byte = structure[position]
+        position += 1
+        if byte == ord('"'):
+            closing = structure.find(b'"', position)
+            position = length if closing < 0 else closing + 1
+        elif byte in b"[{":
+            depth += 1
+        elif depth:
+            depth -= 1
+    return time.monotonic() - started
+
+
+def json_inside_json_frame(records: int) -> bytes:
+    """A tool answer whose text is itself JSON: the shape a Luau dump comes back as.
+
+    Every key and every string value in the inner document arrives as an ESCAPED
+    quote, and every record brings two more brackets, so one frame carries
+    hundreds of thousands of both. None of it is structure: it is one string.
+    """
+    inner = json.dumps(
+        [
+            {"Name": "Part%d" % index, "ClassName": "Part", "Size": [1, 2, 3]}
+            for index in range(records)
+        ]
+    )
+    result = {"content": [{"type": "text", "text": inner}]}
+    return json.dumps({"jsonrpc": "2.0", "id": AWAITED_ID, "result": result}).encode("utf-8")
+
+
+def test_megabytes_of_brackets_are_refused_rather_than_walked():
+    """Depth never passes 1 here, so nothing ends the scan but the last byte.
+
+    Every other hostile shape leaves the walk early: too-deep nesting returns at
+    the 513th opener, and an ordinary frame never enters the walk at all. A
+    frame of `[]` pairs does neither, so it is walked whole, inside `parse_frame`
+    where `--timeout` cannot reach: 8 MiB of them took 0.21 s here, and the
+    budget that bounds a request bought two such frames.
+
+    Megabytes of structure is not a frame anything legitimate sends, so the scan
+    stops at its window and the frame is refused instead of scanned.
+    """
+    line = b"[]" * (MAX_MESSAGE_BYTES // 2)
+
+    with pytest.raises(StudioMcpProtocolError, match="structure"):
+        exceeds_container_depth(line)
+
+
+def test_the_depth_scan_stops_at_its_window_rather_than_at_the_frame():
+    """The window has to be HIT, not merely declared.
+
+    The assertion is a ratio against the same walk with its window removed,
+    measured alongside it on the same bytes, because an absolute budget cannot
+    see this regression: the unbounded walk comes in at 0.37 s, well inside any
+    budget loose enough for CI, so a test written that way passes on exactly the
+    code it exists to fail. The absolute budget stays as well, to catch a
+    bounded path that went slow some other way.
+    """
+    line = b"[]" * (MAX_MESSAGE_BYTES // 2)
+    unbounded = unbounded_depth_walk_seconds(line)
+
+    started = time.monotonic()
+    with pytest.raises(StudioMcpProtocolError, match="structure"):
+        exceeds_container_depth(line)
+    elapsed = time.monotonic() - started
+
+    assert elapsed < HOSTILE_FRAME_SECONDS, f"{len(line)} bytes took {elapsed:.2f}s"
+    assert elapsed * MIN_DEPTH_SCAN_SPEEDUP < unbounded, (
+        f"{len(line)} bytes refused in {elapsed * 1000:.0f} ms, against "
+        f"{unbounded * 1000:.0f} ms walked unbounded: the window is not being hit"
+    )
+
+
+def test_a_tool_answer_of_json_inside_json_is_content_however_much_of_it_there_is():
+    """The one legitimate frame that carries brackets by the hundred thousand.
+
+    `luau 'return HttpService:JSONEncode(...)'` answers with a document inside a
+    string: 200,000 escaped quotes and 40,000 brackets in this one, all of it
+    content. The cheap opener count cannot clear it, so the scan has to read it
+    and has to charge it nothing: a window that counted these would refuse the
+    answer the caller asked for.
+    """
+    frame = json_inside_json_frame(records=20_000)
+    assert frame.count(b"[") + frame.count(b"{") > MAX_FRAME_CONTAINER_DEPTH, "cleared too early"
+
+    message = StdoutFrameReader().parse_frame(frame)
+
+    assert json.loads(message["result"]["content"][0]["text"])[0]["Name"] == "Part0"
+
+
+def test_structure_inside_a_string_is_not_structure_however_much_of_it_there_is():
+    """Two megabytes of brackets in a tool result is one string and one skip.
+
+    The frame is past the window by length alone, and the scan may not refuse it
+    for that: what the window counts is what the walk reads one byte at a time,
+    and a string literal is skipped whole.
+    """
+    source = "[" * (2 * 2**20)
+    frame = json.dumps({"jsonrpc": "2.0", "id": AWAITED_ID, "result": {"source": source}})
+
+    message = StdoutFrameReader().parse_frame(frame.encode("utf-8"))
+
+    assert message["result"]["source"] == source
+
+
+def test_the_window_counts_structure_rather_than_bytes():
+    """A frame far past the window in length, and a hair under it in structure.
+
+    The two numbers this scan could bound are the frame and its structure, and
+    only one of them says anything about what the walk will cost: the padding
+    here is skipped in a `find`, so a bound on length would refuse a frame that
+    costs almost nothing to read.
+    """
+    padding = b'"' + b"x" * (4 * 2**20) + b'",'
+    nested = b"[" * (MAX_FRAME_CONTAINER_DEPTH + 1)
+
+    assert exceeds_container_depth(b"[" + padding + nested) is True
+    assert len(compact_frame_structure(b"[" + padding + nested)) < MAX_DEPTH_SCAN_BYTES
 
 
 def peak_bytes_feeding(frame: bytes) -> int:

@@ -14,7 +14,10 @@ parsed message", which is a job with its own hazards:
   and which `--json` would re-emit for a strict consumer to choke on; a literal
   like `1e400` that overflows to infinity; and nesting past
   `MAX_FRAME_CONTAINER_DEPTH`, because depth is free to send and expensive to
-  hold or to print. Length INSIDE a number is not a hazard of its own and needs
+  hold or to print. The scan that decides that runs before the parse and has a
+  window of its own (`MAX_DEPTH_SCAN_BYTES`), because it is the one pass here
+  that reads a frame one byte at a time. Length INSIDE a number is not a hazard
+  of its own and needs
   no bound: a literal parses in time linear in its digits, measured here at 4 M
   of them in about 7 ms, whether it reaches `parse_float` or the integer
   conversion limit that refuses it.
@@ -76,10 +79,30 @@ NON_JSON_PREVIEW_CHARS = 200
 MAX_FRAME_CONTAINER_DEPTH = 512
 OPENING_CONTAINER_BYTES = b"[{"
 CLOSING_CONTAINER_BYTES = b"]}"
-# The two bytes that drive the depth scan's string state: a quote opens or ends
-# a string literal, and a backslash inside one spends the byte after it.
+STRING_QUOTE = b'"'
 STRING_QUOTE_BYTE = ord('"')
-STRING_ESCAPE_BYTE = ord("\\")
+# The only bytes that can change a frame's nesting or say where a string starts
+# and ends. Everything else is deleted before the walk, so what the walk reads
+# is the frame's structure rather than its length.
+STRUCTURAL_BYTES = STRING_QUOTE + OPENING_CONTAINER_BYTES + CLOSING_CONTAINER_BYTES
+NON_STRUCTURAL_BYTES = bytes(value for value in range(256) if value not in STRUCTURAL_BYTES)
+# The two escape pairs that decide whether the quote after them closes a string.
+# Both are replaced by bytes of the SAME LENGTH that mean nothing to the scan,
+# so the walk needs no escape state and a string can be skipped in one `find`.
+ESCAPED_BACKSLASH = b"\\\\"
+ESCAPED_QUOTE = b'\\"'
+NEUTRALISED_ESCAPE = b"xx"
+# How much of a frame's STRUCTURE the interpreted walk will read before refusing
+# the frame outright. Everything else about the scan runs in C: the opener count
+# that clears an ordinary frame, the compaction below, and the `find` that skips
+# a string literal whole. What is left is the walk, and it runs inside
+# `parse_frame` where `--timeout` cannot reach, so it needs a window of its own:
+# measured here, 8 MiB of "[]" pairs is 0.21 s of walking, and a frame of `{}`
+# the same. A megabyte of structure is past anything real by orders of
+# magnitude (a 46-tool tools/list carries 241 openers in 10 KB, and a Luau
+# answer of 120,000 JSON records carries its brackets INSIDE a string, where
+# they cost one skip), so a frame that spends it is megabytes of brackets.
+MAX_DEPTH_SCAN_BYTES = 2**20
 # What an empty line costs the request's budget. Nothing is parsed or queued for
 # one, but each still costs a find, a slice and a delete, and charged nothing at
 # all a flood of them was the one hazard no bound applied to.
@@ -151,6 +174,34 @@ def refuse_non_finite_number(literal: str) -> float:
     return value
 
 
+def compact_frame_structure(line: bytes) -> bytes:
+    """`line` reduced to the bytes that can change its nesting, in their original order.
+
+    Three C-level passes and no interpretation:
+
+    - `\\\\` becomes two inert bytes, spending an escaped backslash exactly as
+      JSON's own reader spends it, so every backslash still standing introduces
+      the escape after it.
+    - `\\"` becomes two inert bytes, so every quote still standing opens or
+      closes a string literal. Order matters: run this first and `"a\\\\"` reads
+      as an unterminated string.
+    - Everything that is not a quote or a bracket is deleted. Order is
+      preserved, which is all the depth walk reads, and a `\\u0022` or `\\u005B`
+      goes with the rest: the parser reads those as characters inside a string,
+      and so, by deleting them, does this.
+
+    What comes back is usually a few hundred bytes for a frame of megabytes,
+    which is the point: the walk then reads structure instead of length.
+    Replacement is length-preserving only so the two passes cannot disturb each
+    other; the offsets are not used afterwards. CPython hands back the same
+    object when a replacement matches nothing, so a frame with no escapes in it
+    is copied once rather than three times.
+    """
+    neutralised = line.replace(ESCAPED_BACKSLASH, NEUTRALISED_ESCAPE)
+    neutralised = neutralised.replace(ESCAPED_QUOTE, NEUTRALISED_ESCAPE)
+    return neutralised.translate(None, NON_STRUCTURAL_BYTES)
+
+
 def exceeds_container_depth(line: bytes) -> bool:
     """True when a frame nests arrays and objects deeper than we will parse.
 
@@ -159,48 +210,67 @@ def exceeds_container_depth(line: bytes) -> bool:
     "definitely not too deep" without looking at order at all: that is one
     C-level pass (4 ms on 8 MB) and it clears a 700 KB base64 capture.
 
-    Past that, one walk of the bytes, tracking three things as it goes: whether
-    we are inside a string literal, because a brace in Luau source or a minified
-    table is text and not structure; whether the byte before was a backslash
-    spending this one; and the depth itself, which ends the walk the moment it
-    passes the cap. A closer with nothing open leaves the depth at zero rather
-    than taking it negative, so unbalanced tails cannot bank credit against
-    nesting that comes later.
+    Past that, the frame is compacted to its structure and walked once, tracking
+    two things: whether we are inside a string literal, because a brace in Luau
+    source or a minified table is text and not structure, and the depth itself,
+    which ends the walk the moment it passes the cap. A closer with nothing open
+    leaves the depth at zero rather than taking it negative, so unbalanced tails
+    cannot bank credit against nesting that comes later. A string is skipped in
+    one `find`, so a tool result carrying a hundred thousand brackets costs the
+    walk one step, and an unterminated string swallows whatever follows it here
+    exactly as it does for the parser, which refuses the frame a moment later.
 
-    The walk reads strings exactly as JSON does, so it can only disagree with
-    the parser about a frame the parser refuses anyway: an unterminated string
-    swallows whatever follows it here, and fails at the first C-level pass of
-    `json.loads` there.
+    Linear is not enough on its own, because this runs inside `parse_frame`,
+    where nothing preempts it: a frame of `[]` pairs never nests past 1 and
+    never ends early, so 8 MiB of them walked for 0.21 s here and the per-request
+    budget bought two of those. So the walk has a window as well as a rule, and
+    a frame with more structure in it than `MAX_DEPTH_SCAN_BYTES` is refused
+    rather than read, the way `strip_frame_bytes` hands a frame padded past its
+    own window back to C.
 
-    One scan and no regex is the point. This was three passes, the middle one
-    blanking string literals with `"[^"\\]*(?:\\.[^"\\]*)*"`. A frame that opens
-    a string, pads it with escaped quotes and never closes it backtracks that
-    pattern quadratically: 128 KB of it took 42 s, and an 8 MB frame would
-    outlive the caller, all inside `parse_frame` where `--timeout` cannot reach.
+    Reading content at C speed is the point, and so is never handing a frame to
+    a regex. This walked the raw bytes tracking quote and escape state, which is
+    correct and charges tool output exactly what it charges structure; before
+    that it blanked string literals with `"[^"\\]*(?:\\.[^"\\]*)*"`, which a
+    string that opens, pads itself with escaped quotes and never closes
+    backtracks quadratically: 128 KB of it took 42 s, and `tools --timeout 3`
+    ran for 85 seconds.
+
+    Raises:
+        StudioMcpProtocolError: the frame carries more structure than the window,
+            which is megabytes of brackets and nothing a real bridge sends.
     """
     if line.count(b"[") + line.count(b"{") <= MAX_FRAME_CONTAINER_DEPTH:
         return False
+    structure = compact_frame_structure(line)
     depth = 0
-    inside_string = False
-    after_escape = False
-    for byte in line:
-        if inside_string:
-            if after_escape:
-                after_escape = False
-            elif byte == STRING_ESCAPE_BYTE:
-                after_escape = True
-            elif byte == STRING_QUOTE_BYTE:
-                inside_string = False
-            continue
+    position = 0
+    examined = 0
+    length = len(structure)
+    while position < length:
+        byte = structure[position]
+        position += 1
+        examined += 1
+        if examined > MAX_DEPTH_SCAN_BYTES:
+            raise StudioMcpProtocolError(
+                code=UNKNOWN_ERROR_CODE,
+                message=(
+                    f"the proxy sent a {len(line)} byte frame carrying more than "
+                    f"{MAX_DEPTH_SCAN_BYTES} bytes of JSON structure; refusing to scan more of it"
+                ),
+            )
         if byte == STRING_QUOTE_BYTE:
-            inside_string = True
+            closing_quote = structure.find(STRING_QUOTE, position)
+            position = length if closing_quote < 0 else closing_quote + 1
         elif byte in OPENING_CONTAINER_BYTES:
             depth += 1
             if depth > MAX_FRAME_CONTAINER_DEPTH:
                 return True
-        elif byte in CLOSING_CONTAINER_BYTES:
-            if depth:
-                depth -= 1
+        elif depth:
+            # Nothing but quotes and brackets survives the compaction, so this
+            # is a closer. Zero is the floor: 600 closers ahead of 513 openers
+            # read as depth -87 once, which is the frame the cap exists for.
+            depth -= 1
     return False
 
 
