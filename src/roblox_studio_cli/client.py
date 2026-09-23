@@ -237,7 +237,9 @@ class StudioMcpClient:
             StudioNotConnectedError: the proxy went silent AND logged its "no
                 tools" WARN, which is what it does when the MCP toggle is off.
             StudioMcpTimeoutError: silent without that marker, which is an
-                ordinary timeout and must not be reported as the toggle.
+                ordinary timeout and must not be reported as the toggle; or the
+                deadline ran out between pages, which is this method's own
+                refusal rather than the write's (see the loop).
         """
         self.require_started()
         tools: list[ToolDefinition] = []
@@ -247,9 +249,19 @@ class StudioMcpClient:
         # per page for fifty pages.
         byte_budget = MAX_TOOLS_LIST_TOTAL_BYTES
 
-        for _ in range(TOOLS_LIST_PAGE_LIMIT):
+        for page_number in range(1, TOOLS_LIST_PAGE_LIMIT + 1):
             params: dict = {"cursor": cursor} if cursor else {}
-            remaining = max(deadline - time.monotonic(), 0.0)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                # Asking anyway is what `max(..., 0.0)` used to do, and a request
+                # with a spent deadline fails inside `write_all`, which blames
+                # the proxy for not reading its input. The proxy was reading; the
+                # list is longer than the deadline, and that is worth saying.
+                raise StudioMcpTimeoutError(
+                    f"tools/list ran out of its {timeout:.1f}s before it could ask for page "
+                    f"{page_number}; {len(tools)} tools arrived on the pages before it."
+                    f"{self.stderr_suffix()}"
+                )
             try:
                 result = self.send_request(
                     "tools/list", params, timeout=remaining, byte_budget=byte_budget

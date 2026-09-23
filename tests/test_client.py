@@ -47,6 +47,10 @@ DEAF_SERVER_TIMEOUT_SECONDS = 2.0
 STUDIO_ID = "studio-1"
 STRAY_FRAME_COUNT = 6
 DECOY_ANSWER_TIMEOUT_SECONDS = 3.0
+# A `tools/list` deadline, and a first page that spends more than all of it, so
+# the second page starts with nothing left.
+PAGINATION_TIMEOUT_SECONDS = 0.05
+PAGINATION_OVERRUN_SECONDS = 0.1
 # The reply to a server's question travels a second pipe and a drain thread, so
 # it is read out of stderr with a bounded wait rather than assumed to be there.
 SERVER_REPLY_WAIT_SECONDS = 5.0
@@ -113,6 +117,32 @@ def test_list_tools_follows_pagination(fake_client):
     assert "execute_luau" in names
     assert "start_stop_play" in names, "second cursor page was dropped"
     assert len(names) == len(set(names)), "a page was fetched twice"
+
+
+def test_a_page_with_no_time_left_is_reported_as_a_pagination_timeout(fake_client, monkeypatch):
+    """The next page ran on a spent deadline, and blamed the proxy for it.
+
+    `list_tools` hands each page `max(deadline - now, 0)`, so a first page that
+    consumes the whole timeout leaves the second one with 0.0 seconds. A
+    request with no time left fails inside `write_all`, whose refusal says the
+    proxy stopped reading its input: a plausible sentence about a proxy that was
+    reading fine, and the caller goes looking at the bridge instead of at their
+    own `--timeout`.
+    """
+    client = fake_client()
+    pages_requested = []
+
+    def slow_first_page(method, params, timeout, byte_budget=None):
+        pages_requested.append(timeout)
+        time.sleep(PAGINATION_OVERRUN_SECONDS)
+        return {"tools": [], "nextCursor": f"page-{len(pages_requested) + 1}"}
+
+    monkeypatch.setattr(client, "send_request", slow_first_page)
+
+    with pytest.raises(StudioMcpTimeoutError, match="ask for page"):
+        client.list_tools(timeout=PAGINATION_TIMEOUT_SECONDS)
+
+    assert len(pages_requested) == 1, "a page must not be asked for with no time left"
 
 
 def test_tool_definition_exposes_schema(fake_client):
