@@ -35,9 +35,15 @@ from pathlib import Path
 from roblox_studio_cli.errors import StudioRequestError
 
 STDIN_SOURCE_MARKER = "-"
-# Studio's Luau box is not where a multi-megabyte script belongs, and the write
-# to the proxy is bounded too, so say no here where the message can be useful.
+# Studio's Luau box is not where a multi-megabyte script belongs, so say no here,
+# where the message can name the file and the number. This bounds the SOURCE and
+# not the request carrying it: `json.dumps` writes a NUL as the six characters
+# `\u0000`, so a script at this cap can still be a 48 MB write down a pipe that
+# holds 64 KB. What bounds THAT is the deadline on the write itself
+# (`client.write_all`), which is the same deadline the caller set.
 MAX_LUAU_SOURCE_BYTES = 8 * 2**20
+# Every door's answer to a request that carries no script.
+NO_SOURCE_MESSAGE = "provide Luau source as an argument, `-` to read stdin, or --file PATH"
 # Invisible in an editor, a syntax error to Luau: an editor's BOM is not source.
 BYTE_ORDER_MARK = "﻿"
 
@@ -48,20 +54,32 @@ def read_luau_source(code: str | None, file_path: Path | None) -> str:
     Called before the proxy is spawned, so a typo costs nothing but a message.
 
     Raises:
-        StudioRequestError: no source at all, both an argument and a `--file`,
+        StudioRequestError: no source at all (an absent argument, or an empty
+            one from any of the three doors), both an argument and a `--file`,
             or a file (or a stdin stream) this command will not read.
     """
     if file_path is not None:
         if code:
             raise StudioRequestError("pass Luau source as an argument or with --file, not both")
-        return read_bounded_file(file_path)
+        return require_luau_source(read_bounded_file(file_path))
     if code is None:
-        raise StudioRequestError(
-            "provide Luau source as an argument, `-` to read stdin, or --file PATH"
-        )
+        raise StudioRequestError(NO_SOURCE_MESSAGE)
     if code == STDIN_SOURCE_MARKER:
-        return read_bounded_stdin()
-    return code
+        return require_luau_source(read_bounded_stdin())
+    return require_luau_source(code)
+
+
+def require_luau_source(source: str) -> str:
+    """Refuse a request that carries no script, whichever door it came in by.
+
+    An empty argument, an empty file and an empty pipe are all the same
+    mistake, and all three used to spend a proxy spawn, a `tools/list` and a
+    `tools/call` on sending nothing to Studio, which answers that with nothing.
+    Whitespace counts as empty: a file holding one newline is not a script.
+    """
+    if not source.strip():
+        raise StudioRequestError(NO_SOURCE_MESSAGE)
+    return source
 
 
 def read_bounded_stdin() -> str:
