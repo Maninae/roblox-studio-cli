@@ -49,6 +49,17 @@ def test_description_preview_takes_the_first_line_and_truncates():
     assert len(long_tool.description_preview(20)) == 20
 
 
+def test_description_preview_sanitises_before_it_truncates():
+    """Truncating first spent the budget on characters that were about to be stripped.
+
+    A description opening with a few escape sequences previewed as nearly
+    nothing, with the text a reader came for sitting just past the cut.
+    """
+    padded = "\x1b]0;title\x07" * 5 + "what the tool actually does"
+    tool = ToolDefinition(name="x", description=padded, input_schema={})
+    assert tool.description_preview(30) == "what the tool actually does"
+
+
 def test_build_tool_definitions_drops_malformed_entries():
     entries = [
         {"name": "good", "description": "d", "inputSchema": {"properties": {}}},
@@ -132,8 +143,8 @@ def test_is_error_is_read_as_the_boolean_the_spec_says_it_is(flag, expected, rea
 
 @pytest.fixture
 def never_warned(monkeypatch):
-    """Forget that this process already warned, since the warning is a one-shot."""
-    monkeypatch.setattr(mcp_payloads_module, "warned_about_non_boolean_is_error", False)
+    """Forget which types this process already warned about, one warning each."""
+    monkeypatch.setattr(mcp_payloads_module, "warned_is_error_type_names", set())
 
 
 def test_a_non_boolean_is_error_is_logged_as_the_protocol_oddity_it_is(caplog, never_warned):
@@ -168,6 +179,21 @@ def test_the_protocol_warning_is_said_once_for_the_process_not_once_per_result(
         for _ in range(24):
             assert parse_tool_call_result({"isError": "false"}).is_error is True
     assert len(caplog.records) == 1, f"warned {len(caplog.records)} times"
+
+
+def test_a_second_odd_is_error_type_is_a_second_fact_and_gets_said(caplog, never_warned):
+    """One latch for every type meant the second oddity was swallowed by the first.
+
+    A build sending `"false"` from one tool and `1` from another has two things
+    wrong with it, and the one that got logged was whichever ran first.
+    """
+    with caplog.at_level(logging.WARNING, logger="roblox_studio_cli.mcp_payloads"):
+        parse_tool_call_result({"isError": "false"})
+        parse_tool_call_result({"isError": 2})
+        parse_tool_call_result({"isError": [1]})
+        parse_tool_call_result({"isError": "true"})
+    logged_types = [record.args[0] for record in caplog.records]
+    assert logged_types == ["str", "int", "list"], "a different type went unsaid"
 
 
 @pytest.mark.parametrize("answered_id", [2, "2"])

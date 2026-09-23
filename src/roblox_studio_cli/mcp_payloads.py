@@ -59,8 +59,11 @@ MAX_ECHOED_REQUEST_ID_CHARS = 128
 
 # A non-boolean `isError` is a fact about the BUILD, not about one result, and
 # the attach poll alone calls a tool two dozen times inside one command. Said
-# per result, the warning printed over whatever the command was reporting.
-warned_about_non_boolean_is_error = False
+# per result, the warning printed over whatever the command was reporting. One
+# entry per TYPE seen, not one latch for all of them: a build sending `"false"`
+# from one tool and `1` from another said only the first, and the second is a
+# different fact. Bounded by the handful of types JSON can produce.
+warned_is_error_type_names: set[str] = set()
 
 
 @dataclass(frozen=True)
@@ -96,14 +99,17 @@ class ToolDefinition:
         return schema if isinstance(schema, dict) else {}
 
     def description_preview(self, max_chars: int = DESCRIPTION_PREVIEW_CHARS) -> str:
-        """First line of the description, truncated to fit one terminal row."""
-        description = self.description.strip()
+        """First line of the description, sanitised, then cut to one terminal row.
+
+        Sanitising comes first for the same reason `truncate_display_text` says
+        it does: cutting first spends the budget on characters that are about
+        to be stripped, so a description opening with a few escape sequences
+        previewed as almost nothing while its real first line sat past the cut.
+        """
+        description = sanitize_terminal_text(self.description).strip()
         if not description:
             return ""
-        first_line = description.splitlines()[0]
-        if len(first_line) > max_chars:
-            return first_line[: max_chars - 3] + "..."
-        return first_line
+        return truncate_display_text(description.splitlines()[0], max_chars)
 
 
 @dataclass(frozen=True)
@@ -224,21 +230,22 @@ def read_is_error_flag(result: dict) -> bool:
     as a failure, because a server that put something in this field is not
     reporting success and `bool("false")` would otherwise have to decide it, but
     it is logged: a build that starts sending `"isError": "false"` is a protocol
-    change worth being able to find. Once per process, because that is a fact
-    about the build and one attach poll is two dozen calls. Only the TYPE is
-    logged, never the value, since logging's last-resort handler prints to
-    stderr without sanitising.
+    change worth being able to find. Once per TYPE per process, because that is
+    a fact about the build and one attach poll is two dozen calls, and because
+    a second, different type is a second fact that a single latch swallowed.
+    Only the TYPE is logged, never the value, since logging's last-resort
+    handler prints to stderr without sanitising.
     """
-    global warned_about_non_boolean_is_error
     flag = result.get("isError", False)
     if isinstance(flag, bool):
         return flag
     if flag:
-        if not warned_about_non_boolean_is_error:
-            warned_about_non_boolean_is_error = True
+        type_name = type(flag).__name__
+        if type_name not in warned_is_error_type_names:
+            warned_is_error_type_names.add(type_name)
             logger.warning(
                 "tool result carried a non-boolean isError of type %s; reading it as a failure",
-                type(flag).__name__,
+                type_name,
             )
         return True
     return False
