@@ -226,6 +226,13 @@ def copy_target_permissions(descriptor: int, path: Path) -> None:
     first time it was overwritten. Done on the descriptor, before the rename, so
     no moment exists where the finished file has the wrong mode.
 
+    The nine permission bits and nothing above them. Setuid, setgid and the
+    sticky bit belong to the file that had them, not to a new inode filled with
+    bytes a tool just sent. What the replacement does take from its
+    surroundings is ownership (whoever ran the CLI) and, on macOS, the group of
+    the DIRECTORY it was created in, which is BSD inheritance and not something
+    this function chooses.
+
     Silent when the target is gone or is not a regular file: this is about
     keeping what was there, and `check_target_is_writable` already refused
     anything else.

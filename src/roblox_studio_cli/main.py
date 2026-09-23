@@ -125,6 +125,13 @@ def validate_timeout_seconds(value: float) -> float:
     return value
 
 
+# `--out` is a path to WRITE. Typer hands a `Path` parameter to `click.Path`,
+# whose `readable` defaults to True and is checked whenever the path exists, so
+# `--out` at mode 0o000 was refused as "is not readable" by a CLI that was never
+# going to read it. Turning it off lets `image_output` answer instead, which is
+# where every other refusal about this path is decided and worded.
+OUT_PATH_IS_NOT_READ = False
+
 CALL_TIMEOUT_OPTION = typer.Option(
     DEFAULT_CALL_TOOL_TIMEOUT_SECONDS,
     "--timeout",
@@ -372,7 +379,7 @@ def call(
     studio: Optional[str] = STUDIO_OPTION,
     timeout: float = CALL_TIMEOUT_OPTION,
     out: Optional[Path] = typer.Option(
-        None, "--out", help="Where to write returned image content."
+        None, "--out", readable=OUT_PATH_IS_NOT_READ, help="Where to write returned image content."
     ),
     force: bool = FORCE_OPTION,
     as_json: bool = JSON_OPTION,
@@ -455,7 +462,7 @@ def luau(
 @handles_studio_errors
 def screenshot(
     out: Optional[Path] = typer.Option(
-        None, "--out", help="Where to write the capture (default: a temp file)."
+        None, "--out", readable=OUT_PATH_IS_NOT_READ, help="Where to write the capture (default: a temp file)."
     ),
     force: bool = FORCE_OPTION,
     wake_display: bool = typer.Option(

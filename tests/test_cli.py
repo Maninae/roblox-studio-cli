@@ -707,3 +707,27 @@ def test_a_mistyped_option_is_not_quietly_run_as_a_script(typo):
     advice = all_output(result)
     assert "mistyped option" in advice
     assert "--file" in advice, "the message has to name a way through"
+
+
+def test_an_unreadable_out_path_is_answered_by_the_code_that_writes_it(tmp_path):
+    """`--out` is written, never read, so "is not readable" was never the fault.
+
+    Typer builds a `click.Path` for a `Path` parameter, and its `readable`
+    check runs on any path that exists, so `--out` at mode 0o000 failed in the
+    parser with a reason that had nothing to do with the call. The refusals
+    about this path belong to `image_output`, which knows which of them `--force`
+    answers.
+    """
+    target = tmp_path / "locked.png"
+    target.write_bytes(b"the previous capture")
+    target.chmod(0o000)
+
+    refused = invoke(["screenshot", "--out", str(target)])
+    assert refused.exit_code == EXIT_REQUEST_ERROR, all_output(refused)
+    assert "already exists" in all_output(refused)
+    assert "is not readable" not in all_output(refused)
+
+    forced = invoke(["screenshot", "--out", str(target), "--force"])
+    assert forced.exit_code == EXIT_OK, all_output(forced)
+    target.chmod(0o600)
+    assert target.read_bytes().startswith(PNG_MAGIC_BYTES)

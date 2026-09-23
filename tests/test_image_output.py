@@ -295,6 +295,51 @@ def test_a_force_replacement_keeps_the_permissions_it_replaced(tmp_path):
     assert target.read_bytes() == PNG_BYTES
 
 
+@pytest.mark.parametrize(
+    "existing_mode, kept_mode",
+    [
+        (0o4755, 0o755),
+        (0o2755, 0o755),
+        (0o1644, 0o644),
+    ],
+)
+def test_a_force_replacement_leaves_the_setuid_bits_behind(
+    tmp_path, monkeypatch, existing_mode, kept_mode
+):
+    """The nine permission bits are the file's; setuid, setgid and sticky are not.
+
+    A `--force` replacement is a NEW inode that this process created and owns,
+    so carrying `st_mode` over wholesale would hand a capture a tool just sent
+    whatever elevation the file it replaced happened to carry. The nine bits
+    are copied because a capture the caller had made group-readable must stay
+    that way; nothing above them is.
+
+    The mode this asks for is asserted as well as the mode that lands, because
+    macOS clears setuid and setgid itself on an unprivileged `fchmod`. That
+    makes the resulting bits agree with the rule for a reason this code cannot
+    take credit for, and it would go on agreeing on the day the strip is
+    dropped.
+    """
+    requested_modes = []
+    real_fchmod = os.fchmod
+
+    def recording_fchmod(descriptor: int, mode: int) -> None:
+        requested_modes.append(mode)
+        real_fchmod(descriptor, mode)
+
+    monkeypatch.setattr(image_output_module.os, "fchmod", recording_fchmod)
+    target = tmp_path / "shot.png"
+    target.write_bytes(PREVIOUS_CAPTURE)
+    os.chmod(target, existing_mode)
+    assert os.lstat(target).st_mode & 0o7777 == existing_mode, "the test's own setup did not take"
+
+    save_images([PNG_IMAGE], "screen_capture", target, force=True)
+
+    assert requested_modes == [kept_mode], "the replacement was asked for an elevation bit"
+    assert os.lstat(target).st_mode & 0o7777 == kept_mode
+    assert target.read_bytes() == PNG_BYTES
+
+
 def test_a_hard_linked_out_path_is_refused_rather_than_truncated(tmp_path):
     """Truncating one name of a shared inode rewrites the file under every other name."""
     target = tmp_path / "shot.png"
