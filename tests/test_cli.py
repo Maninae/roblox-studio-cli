@@ -632,6 +632,30 @@ def test_a_crowd_of_registered_studios_is_listed_only_as_far_as_it_helps():
     assert "studio-39" not in output
 
 
+def test_the_doctor_report_stops_enumerating_instances_where_every_other_message_does():
+    """Forty rows of chrome between the caller and the verdict it came for.
+
+    The one enumeration outside the cap: against the same build `luau` prints
+    twenty instances and "and 20 more", and `doctor` printed all forty. The
+    count is the bridge's answer and stays exact in the verdict; the rows under
+    it are what gets cut, and `--json` still carries every one of them.
+    """
+    result = invoke(["doctor"], mode="crowded")
+    assert result.exit_code == EXIT_OK, all_output(result)[:500]
+    output = all_output(result)
+
+    assert "CONNECTED (46 tools, 40 instances)" in output, "the exact count was dropped"
+    assert "and 20 more" in output, "the rows ran to the number of open places"
+    assert "studio-39" not in output
+    assert len(output) < 1500, output[:500]
+
+
+def test_the_doctor_json_still_lists_every_instance():
+    """The cap is on rows a terminal prints, never on what a consumer parses."""
+    report = json.loads(invoke(["doctor", "--json"], mode="crowded").output)
+    assert len(report["instances"]) == 40
+
+
 def test_a_server_info_that_is_not_an_object_still_reaches_a_verdict():
     """`"serverInfo": "x"` passed `or {}` and then met `.get` two modules later.
 

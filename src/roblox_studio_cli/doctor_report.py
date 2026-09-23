@@ -35,6 +35,7 @@ from roblox_studio_cli.instance_discovery import (
 )
 from roblox_studio_cli.json_output import compact_json
 from roblox_studio_cli.terminal import (
+    capped_display_names,
     echo_server_text,
     sanitize_diagnostic_line,
     sanitize_terminal_text,
@@ -150,9 +151,14 @@ def render_doctor_report(report: DoctorReport, as_json: bool) -> None:
 
     if report.instances:
         attached = f" after {report.attach_seconds:.1f}s" if report.attach_seconds else ""
-        echo_server_text(f"{'Instances:':<{width}}{report.instances[0].describe()}{attached}")
-        for instance in report.instances[1:]:
-            echo_server_text(f"{'':<{width}}{instance.describe()}")
+        # One row per instance, and the same cap every other enumeration obeys:
+        # forty open places printed forty rows between the caller and the
+        # verdict, which carries the exact count anyway. `--json` still has them
+        # all, because a consumer is not reading a screen.
+        rows = capped_display_names(instance.describe() for instance in report.instances)
+        echo_server_text(f"{'Instances:':<{width}}{rows[0]}{attached}")
+        for row in rows[1:]:
+            echo_server_text(f"{'':<{width}}{row}")
     else:
         typer.echo(f"{'Instances:':<{width}}none registered")
 
