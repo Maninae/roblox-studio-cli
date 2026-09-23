@@ -60,6 +60,10 @@ JPEG_IMAGE = ToolImage("image/jpeg", base64.b64encode(JPEG_BYTES).decode())
 # Declares PNG, carries a shell script: refused by the signature check.
 MISLABELLED_IMAGE = ToolImage("image/png", base64.b64encode(b"#!/bin/sh").decode())
 HOSTILE_TOOL_NAME = "../../../tmp/hostile_escape/pwned"
+# 249 plus ".png" is 253, inside the 255-byte NAME_MAX every filesystem here has.
+LONGEST_LEGAL_OUT_NAME_CHARS = 249
+# Any mode that is not mkstemp's 0600, so an overwrite that dropped to 0600 shows.
+SHARED_FILE_PERMISSIONS = 0o644
 
 
 def test_a_hostile_tool_name_cannot_steer_the_default_path():
@@ -260,6 +264,35 @@ def test_a_bad_frame_does_not_spend_the_force_the_caller_gave_it(tmp_path):
     with pytest.raises(StudioMcpError, match="signature mismatch"):
         save_images([PNG_IMAGE, MISLABELLED_IMAGE], "screen_capture", target, force=True)
     assert target.read_text() == "precious", "the named path was overwritten for a failed result"
+
+
+def test_a_long_out_name_can_still_be_replaced(tmp_path):
+    """The temp file `--force` fills is named by us, not by the caller's `--out`.
+
+    Prefixed with the target's own name, a 249-character `--out` (legal, and it
+    writes fine without `--force`) plus a dot plus mkstemp's eight random
+    characters plus `.partial` came to 267, over NAME_MAX, so the replacement
+    failed with ENAMETOOLONG on a path the first write had accepted.
+    """
+    target = tmp_path / ("s" * LONGEST_LEGAL_OUT_NAME_CHARS + ".png")
+    save_images([PNG_IMAGE], "screen_capture", target, force=False)
+    save_images([JPEG_IMAGE], "screen_capture", target, force=True)
+    assert target.read_bytes() == JPEG_BYTES, "the replacement never landed"
+
+
+def test_a_force_replacement_keeps_the_permissions_it_replaced(tmp_path):
+    """`--force` swaps in a new inode, and mkstemp makes it 0600.
+
+    A capture the caller had deliberately made readable came back private the
+    first time Studio was asked for a fresh one under the same name.
+    """
+    target = tmp_path / "shot.png"
+    target.write_bytes(PREVIOUS_CAPTURE)
+    target.chmod(SHARED_FILE_PERMISSIONS)
+
+    save_images([PNG_IMAGE], "screen_capture", target, force=True)
+    assert target.stat().st_mode & 0o777 == SHARED_FILE_PERMISSIONS
+    assert target.read_bytes() == PNG_BYTES
 
 
 def test_a_hard_linked_out_path_is_refused_rather_than_truncated(tmp_path):

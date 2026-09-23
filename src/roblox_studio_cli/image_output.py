@@ -58,6 +58,17 @@ IMAGE_FILE_PERMISSIONS = 0o600
 # check and the open, and O_NOFOLLOW against one that became a symlink.
 CREATE_EXCLUSIVELY_FLAGS = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
 PARTIAL_FILE_SUFFIX = ".partial"
+# The replacement file's name is ours, not the caller's. Built from the target's
+# own name, it overran NAME_MAX for a `--out` that was itself legal: 249
+# characters, plus a dot, plus `mkstemp`'s eight random ones, plus `.partial`,
+# is 267, so `--force` failed with ENAMETOOLONG on a path that wrote fine
+# without it. Uniqueness is `mkstemp`'s job either way.
+PARTIAL_FILE_PREFIX = ".studio-capture-"
+# Copied from the file a `--force` replaces, so an overwrite does not quietly
+# tighten it to `mkstemp`'s 0600. The nine permission bits only: setuid, setgid
+# and the sticky bit belong to the file that had them, not to a new inode this
+# process owns.
+COPIED_PERMISSION_BITS = 0o777
 # Said in two places on purpose: once by the check that runs before any target
 # is opened, once by the O_EXCL that catches a file created since that check.
 ALREADY_EXISTS_MESSAGE = "{path} already exists; pass --force to overwrite it"
@@ -152,7 +163,7 @@ def check_target_is_writable(path: Path, force: bool) -> None:
 def write_image_bytes(path: Path, data: bytes, force: bool) -> None:
     """Put `data` at `path`, without clobbering anything the caller did not license.
 
-    Two ways in, and neither can leave a half-written file behind:
+    Two ways in, and neither leaves a half-written file under the target's name:
 
     - Without `--force`, `O_CREAT | O_EXCL | O_NOFOLLOW` creates the file or
       says it is already there. The fd is a brand new regular file by
@@ -161,9 +172,21 @@ def write_image_bytes(path: Path, data: bytes, force: bool) -> None:
       renamed onto it. Rename is atomic and replaces the NAME rather than
       following it, so a symlink planted after the check is replaced rather
       than written through, and a write that fails partway (a full disk) leaves
-      the previous capture exactly as it was. The cost is that `--force` now
-      needs write permission on the DIRECTORY, which truncating in place did
-      not; a writable file in a read-only directory is the case that buys.
+      the previous capture exactly as it was.
+
+    What `--force` costs, all of it worth knowing before it surprises someone:
+
+    - Write permission on the DIRECTORY, which truncating in place did not
+      need. A writable file in a read-only directory is the case that buys.
+    - A new inode. The replacement is a file this process created, so it is
+      owned by whoever ran the CLI and keeps none of the original's links or
+      extended attributes. Its permission BITS are copied over before the
+      rename, because arriving at 0600 silently un-shared a capture the caller
+      had made readable.
+    - A `.partial` file beside the target if this process dies mid-write
+      (SIGKILL, or the machine going down). `fill_descriptor` removes it on an
+      ordinary write failure; nothing can remove it when nothing runs. The
+      target itself is untouched in that case, which is the point.
 
     Raises:
         StudioRequestError: the path exists without `--force`, or the write
@@ -181,17 +204,39 @@ def write_image_bytes(path: Path, data: bytes, force: bool) -> None:
 
     try:
         descriptor, temporary_name = tempfile.mkstemp(
-            dir=path.parent, prefix=f".{path.name}.", suffix=PARTIAL_FILE_SUFFIX
+            dir=path.parent, prefix=PARTIAL_FILE_PREFIX, suffix=PARTIAL_FILE_SUFFIX
         )
     except OSError as temp_error:
         raise StudioRequestError(f"cannot write to {path}: {temp_error}") from temp_error
     temporary = Path(temporary_name)
+    copy_target_permissions(descriptor, path)
     fill_descriptor(descriptor, temporary, data)
     try:
         os.replace(temporary, path)
     except OSError as replace_error:
         remove_partial_file(temporary)
         raise StudioRequestError(f"cannot write to {path}: {replace_error}") from replace_error
+
+
+def copy_target_permissions(descriptor: int, path: Path) -> None:
+    """Give a `--force` replacement the permission bits of the file it replaces.
+
+    The replacement is a new inode that `mkstemp` created 0600, so a capture the
+    caller had deliberately made group- or world-readable came back private the
+    first time it was overwritten. Done on the descriptor, before the rename, so
+    no moment exists where the finished file has the wrong mode.
+
+    Silent when the target is gone or is not a regular file: this is about
+    keeping what was there, and `check_target_is_writable` already refused
+    anything else.
+    """
+    existing = lstat_status(path)
+    if existing is None or not stat.S_ISREG(existing.st_mode):
+        return
+    try:
+        os.fchmod(descriptor, stat.S_IMODE(existing.st_mode) & COPIED_PERMISSION_BITS)
+    except OSError as chmod_error:
+        logger.debug("could not copy the permissions of %s: %s", path, chmod_error)
 
 
 def fill_descriptor(descriptor: int, path: Path, data: bytes) -> None:
