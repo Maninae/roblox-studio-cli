@@ -10,6 +10,7 @@ import logging
 
 import pytest
 
+from roblox_studio_cli import mcp_payloads as mcp_payloads_module
 from roblox_studio_cli.errors import StudioMcpError, StudioMcpProtocolError
 from roblox_studio_cli.mcp_payloads import (
     ToolDefinition,
@@ -120,7 +121,13 @@ def test_is_error_is_read_as_the_boolean_the_spec_says_it_is(flag, expected, rea
     assert parse_tool_call_result({"isError": flag}).is_error is expected, reason
 
 
-def test_a_non_boolean_is_error_is_logged_as_the_protocol_oddity_it_is(caplog):
+@pytest.fixture
+def never_warned(monkeypatch):
+    """Forget that this process already warned, since the warning is a one-shot."""
+    monkeypatch.setattr(mcp_payloads_module, "warned_about_non_boolean_is_error", False)
+
+
+def test_a_non_boolean_is_error_is_logged_as_the_protocol_oddity_it_is(caplog, never_warned):
     """The outcome is the same either way; the point is that somebody can find out why.
 
     A build that starts sending `"isError": "false"` is a Studio-side protocol
@@ -137,6 +144,21 @@ def test_a_non_boolean_is_error_is_logged_as_the_protocol_oddity_it_is(caplog):
     with caplog.at_level(logging.WARNING, logger="roblox_studio_cli.mcp_payloads"):
         parse_tool_call_result({"isError": True})
     assert caplog.text == "", "an ordinary boolean warned about nothing"
+
+
+def test_the_protocol_warning_is_said_once_for_the_process_not_once_per_result(
+    caplog, never_warned
+):
+    """One attach poll is two dozen calls, and a stuck build makes every one of them odd.
+
+    The fact is about the build, so it is worth saying once. Said per result, a
+    12-second attach wait against a server with a string `isError` printed the
+    same warning two dozen times over whatever the command was reporting.
+    """
+    with caplog.at_level(logging.WARNING, logger="roblox_studio_cli.mcp_payloads"):
+        for _ in range(24):
+            assert parse_tool_call_result({"isError": "false"}).is_error is True
+    assert len(caplog.records) == 1, f"warned {len(caplog.records)} times"
 
 
 def test_raise_for_rpc_error_reads_both_shapes():

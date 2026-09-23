@@ -43,6 +43,11 @@ IMAGE_SIGNATURES_BY_FILE_EXTENSION: dict[str, tuple[tuple[int, bytes], ...]] = {
 
 DESCRIPTION_PREVIEW_CHARS = 100
 
+# A non-boolean `isError` is a fact about the BUILD, not about one result, and
+# the attach poll alone calls a tool two dozen times inside one command. Said
+# per result, the warning printed over whatever the command was reporting.
+warned_about_non_boolean_is_error = False
+
 
 @dataclass(frozen=True)
 class ToolDefinition:
@@ -205,17 +210,22 @@ def read_is_error_flag(result: dict) -> bool:
     as a failure, because a server that put something in this field is not
     reporting success and `bool("false")` would otherwise have to decide it, but
     it is logged: a build that starts sending `"isError": "false"` is a protocol
-    change worth being able to find. Only the TYPE is logged, never the value,
-    since logging's last-resort handler prints to stderr without sanitising.
+    change worth being able to find. Once per process, because that is a fact
+    about the build and one attach poll is two dozen calls. Only the TYPE is
+    logged, never the value, since logging's last-resort handler prints to
+    stderr without sanitising.
     """
+    global warned_about_non_boolean_is_error
     flag = result.get("isError", False)
     if isinstance(flag, bool):
         return flag
     if flag:
-        logger.warning(
-            "tool result carried a non-boolean isError of type %s; reading it as a failure",
-            type(flag).__name__,
-        )
+        if not warned_about_non_boolean_is_error:
+            warned_about_non_boolean_is_error = True
+            logger.warning(
+                "tool result carried a non-boolean isError of type %s; reading it as a failure",
+                type(flag).__name__,
+            )
         return True
     return False
 
