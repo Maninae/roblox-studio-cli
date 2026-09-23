@@ -98,9 +98,21 @@ def wall_clock_budget(seconds: float, description: str):
     can: the regex engine checks for signals as it runs, so the alarm turns the
     hang into a failure after 1.08 s. Main thread only, which is where pytest
     runs a test.
+
+    A process has one real-time timer, and this takes it: adding pytest-timeout
+    in its `signal` method (SIGALRM, armed per test) would have its timer
+    cancelled by the `setitimer(0)` below and its handler put back without one,
+    so that test would run unbounded and say nothing about it. The suite has no
+    such plugin today, and the pinned test extra is where it would arrive.
     """
+    disarmed = False
 
     def ring(signal_number, frame):
+        # The timer is one-shot, and the moment between the block's last
+        # statement and the cancellation below belongs to nobody: an alarm
+        # landing there would fail a block that finished inside its budget.
+        if disarmed:
+            return
         raise TimeoutError(f"{description} spent more than {seconds:.1f}s")
 
     previous_handler = signal.signal(signal.SIGALRM, ring)
@@ -108,6 +120,7 @@ def wall_clock_budget(seconds: float, description: str):
     try:
         yield
     finally:
+        disarmed = True
         signal.setitimer(signal.ITIMER_REAL, 0)
         signal.signal(signal.SIGALRM, previous_handler)
 
@@ -184,6 +197,21 @@ def test_a_frame_dropped_unparsed_is_copied_once_rather_than_twice():
     assert peak < len(frame) * MAX_PEAK_BYTES_PER_FRAME, (
         f"{len(frame)} bytes peaked at {peak} ({peak / len(frame):.1f}x)"
     )
+
+
+def test_the_budget_helper_does_not_fail_a_block_that_already_finished():
+    """The alarm and the cancellation race, and the alarm is allowed to win.
+
+    Delivery cannot be scheduled into that window from a test, so this asks the
+    handler what it would do if it were: armed, it raises into whatever is
+    running when the signal lands, which by then is the teardown of a block that
+    came in under its budget. Disarmed, it returns and the one-shot timer that
+    nobody cancelled in time costs nothing.
+    """
+    with wall_clock_budget(HOSTILE_FRAME_SECONDS, "a block that finishes"):
+        armed_handler = signal.getsignal(signal.SIGALRM)
+
+    assert armed_handler(signal.SIGALRM, None) is None, "a late alarm failed a finished block"
 
 
 def test_a_frame_that_ends_in_crlf_is_copied_once_as_well():
