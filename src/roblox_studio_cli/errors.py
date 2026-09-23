@@ -15,6 +15,13 @@ and the image writer can all raise the same classes without importing each
 other. `main.exit_code_for` is the only place that turns a class into a number.
 """
 
+# The three statuses this CLI exits with. They live beside the taxonomy that
+# decides between them; `main.exit_code_for` is the one place a class becomes
+# one of these numbers.
+EXIT_OK = 0
+EXIT_NOT_READY = 1
+EXIT_REQUEST_ERROR = 2
+
 # What a JSON-RPC `code` becomes when the server did not send an integer.
 UNKNOWN_ERROR_CODE = -1
 # How much of the code is worth printing. A server picks it, Python integers

@@ -8,7 +8,7 @@ Orientation for anyone (human or agent) changing this repo. The README explains 
 
 | Module | Responsibility |
 | --- | --- |
-| `errors.py` | The exception taxonomy, and the exit code each class maps onto. A leaf, so every layer can raise the same classes. |
+| `errors.py` | The exception taxonomy, the three exit statuses, and the exit code each class maps onto. A leaf, so every layer can raise the same classes. |
 | `terminal.py` | Strip terminal control sequences out of server-controlled text before echoing it. |
 | `mcp_payloads.py` | The payload shapes a server answers with: tool definitions, tool results, images, the JSON-RPC error envelope. |
 | `framing.py` | Stdout bytes to JSON-RPC messages: line buffering, defensive parsing, the byte budgets, the large-frame id peek, and which parsed frame answers the request in flight. Knows nothing of processes. |
@@ -20,10 +20,11 @@ Orientation for anyone (human or agent) changing this repo. The README explains 
 | `luau_source.py` | Where one `luau` call's source comes from: an argument, stdin, or a file, with the same byte cap on the two that read somebody else's bytes. |
 | `display_wake.py` | macOS only: wake the display for a capture and hold it awake, because a dark display captures nothing. |
 | `json_output.py` | How `--json` reaches stdout: one compact line, and strict JSON. A leaf, imported by both `main` and `doctor_report`. |
+| `result_output.py` | What one tool result becomes on the way out: the failure gate, the images, and the two output modes. |
 | `doctor_report.py` | The `doctor` health check: gather the four facts, render them, name the verdict. |
 | `main.py` | Typer commands, output, exit codes. No protocol knowledge. |
 
-Sizes are a budget, not a suggestion: `wc -l src/roblox_studio_cli/*.py` should show nothing over ~600 lines. When one grows, extract a responsibility you can name in a short phrase, not an arbitrary half. `framing.py` came out of `client.py` that way, and the seam it left is worth keeping: framing takes bytes and gives back messages, so a framing bug reproduces by calling `feed()` with a literal, and the client stays the only module that knows there is a child process. With `client` and `discovery` both split, `main.py` is the largest file left, so it is the next one to watch.
+Sizes are a budget, not a suggestion: `wc -l src/roblox_studio_cli/*.py` should show nothing over ~600 lines. When one grows, extract a responsibility you can name in a short phrase, not an arbitrary half. `framing.py` came out of `client.py` that way, and the seam it left is worth keeping: framing takes bytes and gives back messages, so a framing bug reproduces by calling `feed()` with a literal, and the client stays the only module that knows there is a child process. `main.py` went the same way when threading `--timeout` through every command pushed it to 602: what came out is `result_output`, the only module that reads a `ToolCallResult`, so the rules about a call that failed and about `--json` next to `--out` are decided once instead of in each command. What is left there is app plumbing (the flags, the error decorator, the exit-code rule) and eight commands, and the plumbing is the seam to take next, because the commands are what the file is for.
 
 `client.py` came off that ceiling the way `framing` did, and `stderr_capture` is what came out: the ring buffer, the sanitised suffix an exception quotes, and the no-tools marker that tells the toggle from an ordinary silence. None of it knows a request exists, so the client hands it the child's stderr stream once and reads diagnostics back.
 
