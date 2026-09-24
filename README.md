@@ -1,4 +1,6 @@
-# roblox-studio
+<p align="center">
+  <img src="assets/banner/banner.png" alt="roblox-studio: the Roblox Studio icon drawn in Luau source, beside a terminal running roblox-studio doctor, luau, and screenshot" width="820">
+</p>
 
 Run Luau and capture the viewport in a live Roblox Studio, from a shell.
 
