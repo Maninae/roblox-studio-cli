@@ -2,7 +2,7 @@
   <img src="assets/banner/banner.png" alt="roblox-studio: the Roblox Studio icon drawn in Luau source, beside a terminal running roblox-studio doctor, luau, and screenshot" width="820">
 </p>
 
-Run Luau and capture the viewport in a live Roblox Studio, from a shell.
+Drive the Roblox Studio you already have open from a shell: run Luau, capture the viewport, and call any tool Studio ships, with nothing installed in Studio.
 
 <p align="center">
   <a href="https://github.com/Maninae/roblox-studio-cli/actions/workflows/test.yml"><img alt="tests" src="https://github.com/Maninae/roblox-studio-cli/actions/workflows/test.yml/badge.svg"></a>
@@ -13,10 +13,10 @@ Run Luau and capture the viewport in a live Roblox Studio, from a shell.
 
 ---
 
-Studio 0.739 and later ships an MCP server inside the app. `roblox-studio` calls it from the shell, without registering it with any agent runtime.
+Studio 0.739 and later ships an MCP server inside the app, and that server is the whole backend here, reached without registering it with any agent runtime. The tool list is read fresh on every run, so a tool Roblox adds in a Studio update is callable the day it ships.
 
-- **Nothing to install in Studio**: spawns Studio's own `StudioMCP` binary per call.
-- **Plain commands**: `luau`, `screenshot`, `state`, `play`, `instances`, and `call` for any of the 28 tools.
+- **Nothing to install or keep running**: each command spawns Studio's own `StudioMCP` binary and shuts it down when it finishes.
+- **Every built-in tool, not only Luau**: `screenshot` captures the viewport, `play` toggles play mode, and `call` reaches any of the 28 tools (`inspect_instance`, `search_asset`, and the rest) with JSON arguments.
 - **Knows Studio**: finds the instance id, waits for Studio to attach, and `doctor` says what to fix when it can't.
 - **Agent-safe output**: control characters and invisible Unicode stripped, every frame budgeted, one exit-code rule.
 
@@ -122,21 +122,22 @@ Budgets, caps, known costs, and the module map: [AGENTS.md](AGENTS.md).
 
 ## Where this fits
 
-Verified 2026-09-22.
+Verified 2026-09-25.
 
-| Tool | What it is | Live Studio Luau? | Installs into Studio? | Shell one-shots? | Knows Studio? | Status |
-| --- | --- | --- | --- | --- | --- | --- |
-| **`roblox-studio`** (this) | CLI over Studio's built-in MCP server | Yes | Nothing | Yes | Yes | Active |
-| [Studio's built-in MCP server](https://create.roblox.com/docs/studio/mcp) | The bridge itself | Yes | Built in | No | n/a | Shipped in Studio |
-| [Roblox/studio-rust-mcp-server](https://github.com/Roblox/studio-rust-mcp-server) | Roblox's earlier server plus plugin | Yes | A plugin | No | No | Archived April 2026 |
-| [revvy02/rodeo](https://github.com/revvy02/rodeo) | Studio CLI and Luau runtime | Yes | Its own plugin | Yes | Partial | Small, active |
-| [mcporter](https://github.com/openclaw/mcporter), [inspector --cli](https://github.com/modelcontextprotocol/inspector), [mcptools](https://github.com/f/mcptools), [mcp-cli](https://github.com/wong2/mcp-cli) | Generic MCP-to-shell bridges | Yes, pointed at the binary | Nothing | Yes, raw JSON args | No | Active (mcptools stale since Dec 2025) |
-| [Rojo](https://github.com/rojo-rbx/rojo), [Argon](https://github.com/argon-rbx/argon) | File sync into Studio | No | A plugin | n/a | n/a | Active |
-| [Lune](https://github.com/lune-org/lune) | Standalone Luau runtime | No | No | Yes | n/a | Active |
-| [run-in-roblox](https://github.com/rojo-rbx/run-in-roblox) | Launches its own Studio to run a script | Not your session | No | Yes | No | Dormant since March 2024 |
-| [Open Cloud Luau Execution](https://create.roblox.com/docs/cloud/guides/luau-execution), [rbxcloud](https://github.com/Sleitnick/rbxcloud) | Luau on a cloud server, published place | No | No | Yes | n/a | Active |
+| Tool | What it is | Live Studio Luau? | Studio's other tools? | Installs into Studio? | Shell one-shots? | Knows Studio? | Status |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| **`roblox-studio`** (this) | CLI over Studio's built-in MCP server | Yes | All, by name | Nothing | Yes | Yes | Active |
+| [Studio's built-in MCP server](https://create.roblox.com/docs/studio/mcp) | The bridge itself | Yes | All, through an MCP client | Built in | No | n/a | Shipped in Studio |
+| [Studio command-line flags](https://create.roblox.com/docs/studio/command-line-interface) | Launch options: open a place, run a script, dump the API | Only in the Studio it launches | No | Built in | Yes | n/a | Shipped in Studio |
+| [revvy02/rodeo](https://github.com/revvy02/rodeo) | Luau runtime for Studio: any DataModel and identity, streamed stdio | Yes, the deepest here | Not exposed | Its own plugin, plus `rodeo serve` | Yes | Yes | Active, frequent releases |
+| [Roblox/studio-rust-mcp-server](https://github.com/Roblox/studio-rust-mcp-server) | Roblox's earlier server plus plugin | Yes | Its own set | A plugin | No | No | Archived April 2026 |
+| [mcporter](https://github.com/openclaw/mcporter), [inspector --cli](https://github.com/modelcontextprotocol/inspector), [mcptools](https://github.com/f/mcptools), [mcp-cli](https://github.com/wong2/mcp-cli) | Generic MCP-to-shell bridges | Yes, pointed at the binary | All, raw JSON args | Nothing | Yes | No | Active (mcptools stale since Dec 2025) |
+| [Rojo](https://github.com/rojo-rbx/rojo), [Argon](https://github.com/argon-rbx/argon) | File sync into Studio | No | No | A plugin | n/a | n/a | Active |
+| [Lune](https://github.com/lune-org/lune) | Standalone Luau runtime | No | No | No | Yes | n/a | Active |
+| [run-in-roblox](https://github.com/rojo-rbx/run-in-roblox) | Launches its own Studio to run a script | Not your session | No | No | Yes | No | Dormant since March 2024 |
+| [Open Cloud Luau Execution](https://create.roblox.com/docs/cloud/guides/luau-execution), [rbxcloud](https://github.com/Sleitnick/rbxcloud) | Luau on a cloud server, published place | No | No | No | Yes | n/a | Active |
 
-A generic bridge is the better pick when you need many MCP servers. This one is for a Studio you already have open.
+Pick by the job. When the work is a Luau program running inside Studio (client and server code during a playtest, stdin and stdout streamed while it runs, places saved and exported, or Windows), rodeo is the stronger runtime and worth its plugin. When you want the viewport, Studio's other built-in tools, or a quick check against the session already open, this CLI does it with nothing installed. Studio's own launch flags suit CI jobs that start a fresh Studio, and a generic MCP bridge is the better pick when you juggle many MCP servers besides Studio's.
 
 ## Development
 
